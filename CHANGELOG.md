@@ -8,9 +8,12 @@ matching GitHub Release (tag `v<version>`) automatically as the last step
 of every push (see the README) - a plain git tag on its own isn't enough
 for HACS to notice.
 
-Versions are plain semver (`MAJOR.MINOR.PATCH`).
+Versions are **year.month.release**, like ESS Manager's own (as of
+2026.10.0): the year and month the release is made, then a number counting
+the releases in that month from 0 - `2026.10.0`, `2026.10.1`, ...,
+`2026.11.0`.
 
-## [0.1.0] - 2026-10-09
+## [2026.10.0] - 2026-10-09
 
 ### Added
 - First working version: a full Python port of the original
