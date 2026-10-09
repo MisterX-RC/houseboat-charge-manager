@@ -1,0 +1,57 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Houseboat Charge Manager",
+        "description": "Pick every entity the charge planner needs. All of them are required - this mirrors the entities the original template sensor had hardcoded.",
+        "data": {
+          "name": "Name",
+          "battery_soc_entity": "Battery SoC sensor",
+          "battery_voltage_entity": "Battery voltage sensor",
+          "cell_max_voltage_entity": "Highest cell voltage sensor",
+          "cell_min_voltage_entity": "Lowest cell voltage sensor",
+          "price_entity": "Electricity price sensor (Nordpool-style, with today/tomorrow attributes)",
+          "price_14d_average_entity": "14-day average price sensor",
+          "shore_power_entity": "Shore power draw sensor",
+          "avg_load_entity": "24h average load sensor",
+          "walstroom_requested_entity": "Requested shore power current (input_number, amps)",
+          "start_voyage_entity": "Hours until departure (input_number)",
+          "low_battery_percentage_entity": "Low-battery floor percentage (input_number)",
+          "vacation_mode_entity": "Vacation mode switch (input_boolean)",
+          "force_full_charge_entity": "Force-100% override switch (input_boolean)",
+          "grid_switch_entity": "Shore power relay/switch"
+        }
+      }
+    },
+    "error": {
+      "unknown": "Unexpected error"
+    },
+    "abort": {
+      "already_configured": "This houseboat is already configured"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Re-point entities",
+        "description": "Change which entity each input reads from. Tunable thresholds (battery size, price margins, SoC floors, ...) are their own `number` entities - edit those directly on the dashboard instead.",
+        "data": {
+          "battery_soc_entity": "Battery SoC sensor",
+          "battery_voltage_entity": "Battery voltage sensor",
+          "cell_max_voltage_entity": "Highest cell voltage sensor",
+          "cell_min_voltage_entity": "Lowest cell voltage sensor",
+          "price_entity": "Electricity price sensor (Nordpool-style, with today/tomorrow attributes)",
+          "price_14d_average_entity": "14-day average price sensor",
+          "shore_power_entity": "Shore power draw sensor",
+          "avg_load_entity": "24h average load sensor",
+          "walstroom_requested_entity": "Requested shore power current (input_number, amps)",
+          "start_voyage_entity": "Hours until departure (input_number)",
+          "low_battery_percentage_entity": "Low-battery floor percentage (input_number)",
+          "vacation_mode_entity": "Vacation mode switch (input_boolean)",
+          "force_full_charge_entity": "Force-100% override switch (input_boolean)",
+          "grid_switch_entity": "Shore power relay/switch"
+        }
+      }
+    }
+  }
+}

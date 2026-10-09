@@ -1,0 +1,57 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Houseboat Charge Manager",
+        "description": "Kies elke entiteit die de laadplanner nodig heeft. Alles is verplicht - dit zijn dezelfde entiteiten die de originele template-sensor hardcoded had.",
+        "data": {
+          "name": "Naam",
+          "battery_soc_entity": "Accu SoC-sensor",
+          "battery_voltage_entity": "Accuspanning-sensor",
+          "cell_max_voltage_entity": "Hoogste celspanning-sensor",
+          "cell_min_voltage_entity": "Laagste celspanning-sensor",
+          "price_entity": "Stroomprijs-sensor (Nordpool-achtig, met today/tomorrow attributen)",
+          "price_14d_average_entity": "14-daags gemiddelde prijs-sensor",
+          "shore_power_entity": "Walstroom-vermogensensor",
+          "avg_load_entity": "24u-gemiddeld-verbruik-sensor",
+          "walstroom_requested_entity": "Gevraagde walstroom (input_number, ampère)",
+          "start_voyage_entity": "Uren tot vertrek (input_number)",
+          "low_battery_percentage_entity": "Low-battery-vloer percentage (input_number)",
+          "vacation_mode_entity": "Vakantiemodus-schakelaar (input_boolean)",
+          "force_full_charge_entity": "Forceer-100%-override-schakelaar (input_boolean)",
+          "grid_switch_entity": "Walstroom-relais/schakelaar"
+        }
+      }
+    },
+    "error": {
+      "unknown": "Onverwachte fout"
+    },
+    "abort": {
+      "already_configured": "Deze boot is al geconfigureerd"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Entiteiten aanpassen",
+        "description": "Pas aan welke entiteit elke invoer gebruikt. Instelbare drempelwaarden (batterijgrootte, prijsmarges, SoC-grenzen, ...) zijn hun eigen `number`-entiteiten - pas die direct op het dashboard aan.",
+        "data": {
+          "battery_soc_entity": "Accu SoC-sensor",
+          "battery_voltage_entity": "Accuspanning-sensor",
+          "cell_max_voltage_entity": "Hoogste celspanning-sensor",
+          "cell_min_voltage_entity": "Laagste celspanning-sensor",
+          "price_entity": "Stroomprijs-sensor (Nordpool-achtig, met today/tomorrow attributen)",
+          "price_14d_average_entity": "14-daags gemiddelde prijs-sensor",
+          "shore_power_entity": "Walstroom-vermogensensor",
+          "avg_load_entity": "24u-gemiddeld-verbruik-sensor",
+          "walstroom_requested_entity": "Gevraagde walstroom (input_number, ampère)",
+          "start_voyage_entity": "Uren tot vertrek (input_number)",
+          "low_battery_percentage_entity": "Low-battery-vloer percentage (input_number)",
+          "vacation_mode_entity": "Vakantiemodus-schakelaar (input_boolean)",
+          "force_full_charge_entity": "Forceer-100%-override-schakelaar (input_boolean)",
+          "grid_switch_entity": "Walstroom-relais/schakelaar"
+        }
+      }
+    }
+  }
+}

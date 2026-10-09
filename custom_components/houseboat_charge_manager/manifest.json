@@ -1,0 +1,13 @@
+{
+  "domain": "houseboat_charge_manager",
+  "name": "Houseboat Charge Manager",
+  "after_dependencies": ["frontend", "http"],
+  "codeowners": ["@MisterX-RC"],
+  "config_flow": true,
+  "documentation": "https://github.com/MisterX-RC/houseboat-charge-manager",
+  "integration_type": "hub",
+  "iot_class": "calculated",
+  "issue_tracker": "https://github.com/MisterX-RC/houseboat-charge-manager/issues",
+  "requirements": [],
+  "version": "0.1.0"
+}
