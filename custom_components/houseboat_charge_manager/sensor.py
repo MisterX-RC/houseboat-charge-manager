@@ -42,6 +42,7 @@ VALUE_SENSORS: tuple[tuple[str, str, str, str | None, str], ...] = (
     ("battery_energy", "Battery energy", "battery_energy", "kWh", "mdi:battery"),
     ("usable_energy", "Usable energy", "usable_energy", "kWh", "mdi:battery-50"),
     ("dynamic_voyage_charge_hours", "Hours needed to reach full for departure", "dynamic_voyage_charge_hours", "h", "mdi:sail-boat"),
+    ("vacation_departure_target_percent", "Vacation departure target", "vacation_departure_target_percent", "%", "mdi:beach"),
 )
 
 

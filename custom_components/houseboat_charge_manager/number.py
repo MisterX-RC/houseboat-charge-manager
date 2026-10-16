@@ -77,9 +77,18 @@ class HouseboatTunableNumber(RestoreEntity, NumberEntity):
             try:
                 value = float(last_state.state)
             except (TypeError, ValueError):
-                return
-            self._attr_native_value = value
-            self._coordinator.set_number_value(self._key, value)
+                value = None
+            if value is not None:
+                self._attr_native_value = value
+                self._coordinator.set_number_value(self._key, value)
+        # Lets the coordinator write this entity's value back directly (see
+        # vacation_departure_target_days' grid-unavailable reset) without
+        # this entity being the only source of truth for its own value.
+        self._coordinator.register_number_entity(self._key, self)
+
+    async def async_will_remove_from_hass(self) -> None:
+        self._coordinator.unregister_number_entity(self._key)
+        await super().async_will_remove_from_hass()
 
     async def async_set_native_value(self, value: float) -> None:
         self._attr_native_value = value

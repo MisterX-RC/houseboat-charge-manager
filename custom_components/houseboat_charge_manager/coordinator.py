@@ -31,7 +31,9 @@ from .const import (
     CONF_START_VOYAGE_ENTITY,
     CONF_VACATION_MODE_ENTITY,
     CONF_WALSTROOM_REQUESTED_ENTITY,
+    DEFAULT_VACATION_DEPARTURE_TARGET_DAYS,
     DOMAIN,
+    NUM_VACATION_DEPARTURE_TARGET_DAYS,
     NUMBER_DEFINITIONS,
     STORAGE_KEY_SUFFIX,
     STORAGE_VERSION,
@@ -39,6 +41,28 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+# Entities where "unavailable"/"unknown"/missing must NEVER be silently read
+# as 0 (or False) and fed into the calculation - a sensor dropout is not the
+# same thing as "battery at 0%" or "0 W load", and treating it that way can
+# make the planner force an unwanted charge session, or wrongly report the
+# cells as perfectly balanced (both readings defaulting to the same 0).
+# CONF_GRID_SWITCH_ENTITY is deliberately NOT in this list: that entity's
+# own "unavailable" state is how is_grid_unavailable is detected in the
+# first place (see below), so it's a meaningful signal there, not an error.
+_CRITICAL_ENTITY_KEYS: tuple[tuple[str, str], ...] = (
+    (CONF_BATTERY_SOC_ENTITY, "battery SoC"),
+    (CONF_BATTERY_VOLTAGE_ENTITY, "battery voltage"),
+    (CONF_CELL_MAX_VOLTAGE_ENTITY, "highest cell voltage"),
+    (CONF_CELL_MIN_VOLTAGE_ENTITY, "lowest cell voltage"),
+    (CONF_PRICE_ENTITY, "electricity price"),
+    (CONF_PRICE_14D_AVERAGE_ENTITY, "14-day average price"),
+    (CONF_SHORE_POWER_ENTITY, "shore power draw"),
+    (CONF_AVG_LOAD_ENTITY, "average load"),
+    (CONF_WALSTROOM_REQUESTED_ENTITY, "requested shore power"),
+    (CONF_START_VOYAGE_ENTITY, "hours until departure"),
+    (CONF_LOW_BATTERY_PERCENTAGE_ENTITY, "low-battery floor"),
+)
 
 
 def _state_float(hass: HomeAssistant, entity_id: str | None, default: float = 0.0) -> float:
@@ -98,6 +122,12 @@ class HouseboatChargeManagerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._store: Store = Store(hass, STORAGE_VERSION, f"{DOMAIN}_{entry.entry_id}{STORAGE_KEY_SUFFIX}")
         self._prev: dict[str, Any] = {}
         self._number_values: dict[str, float] = {key: default for key, default, *_ in NUMBER_DEFINITIONS}
+        # Registered by each HouseboatTunableNumber in number.py once it's
+        # added to hass - lets the coordinator write a value back into the
+        # live entity itself (not just its own cached copy), e.g. resetting
+        # vacation_departure_target_days when shore power drops with no
+        # departure pending.
+        self._number_entities: dict[str, Any] = {}
 
     async def async_load_persisted_state(self) -> None:
         stored = await self._store.async_load()
@@ -110,12 +140,36 @@ class HouseboatChargeManagerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def get_number_value(self, key: str, default: float = 0.0) -> float:
         return self._number_values.get(key, default)
 
+    def register_number_entity(self, key: str, entity: Any) -> None:
+        """Called by number.py once an entity is added to hass."""
+        self._number_entities[key] = entity
+
+    def unregister_number_entity(self, key: str) -> None:
+        self._number_entities.pop(key, None)
+
+    async def _async_reset_number_to_default(self, key: str, default: float) -> None:
+        self._number_values[key] = default
+        entity = self._number_entities.get(key)
+        if entity is not None:
+            await entity.async_set_native_value(default)
+
     def _conf(self, key: str) -> str | None:
         return {**self.entry.data, **self.entry.options}.get(key)
 
     async def _async_update_data(self) -> dict[str, Any]:
         hass = self.hass
         now = dt_util.now()
+
+        missing: list[str] = []
+        for conf_key, label in _CRITICAL_ENTITY_KEYS:
+            entity_id = self._conf(conf_key)
+            state = hass.states.get(entity_id) if entity_id else None
+            if state is None or state.state in ("unavailable", "unknown", ""):
+                missing.append(f"{label} ({entity_id or 'not configured'})")
+        if missing:
+            raise UpdateFailed(
+                "Waiting for sensor data - unavailable, unknown or not configured: " + "; ".join(missing)
+            )
 
         soc = _state_float(hass, self._conf(CONF_BATTERY_SOC_ENTITY))
         voltage = _state_float(hass, self._conf(CONF_BATTERY_VOLTAGE_ENTITY))
@@ -161,6 +215,11 @@ class HouseboatChargeManagerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
         except Exception as err:  # noqa: BLE001 - never let a bad cycle crash the coordinator
             raise UpdateFailed(f"Houseboat Charge Manager calculation failed: {err}") from err
+
+        if result.get("should_reset_vacation_departure_target_days"):
+            await self._async_reset_number_to_default(
+                NUM_VACATION_DEPARTURE_TARGET_DAYS, DEFAULT_VACATION_DEPARTURE_TARGET_DAYS
+            )
 
         self._prev = result
         await self._store.async_save(logic.serialize_prev(result))

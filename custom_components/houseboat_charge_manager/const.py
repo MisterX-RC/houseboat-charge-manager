@@ -146,6 +146,24 @@ DEFAULT_HIGH_SHORE_LOAD_THRESHOLD_W = 500.0
 NUM_SOC_CRITICAL_PERCENT = "soc_critical_percent"
 DEFAULT_SOC_CRITICAL_PERCENT = 40.0
 
+# In vacation mode, how many days of usable energy (above the low-battery
+# floor) should be available at departure time. Replaces the fixed 90%
+# vacation ceiling with a dynamic target; the default (15) is deliberately
+# large enough to saturate at 100% for any realistic load/battery size, so
+# "limited" vacation charging is an opt-in the user dials down themselves.
+NUM_VACATION_DEPARTURE_TARGET_DAYS = "vacation_departure_target_days"
+DEFAULT_VACATION_DEPARTURE_TARGET_DAYS = 15.0
+
+# Extra hours before the actual departure time that charging must be
+# finished, kept as spare buffer for unexpected consumption during
+# charging. Inflates the day-based target by that many hours' worth of
+# load, and shifts the voyage charge-by deadline earlier by the same
+# amount (vacation mode only - deliberately separate from
+# voyage_settle_margin_hours, which still applies to the non-vacation
+# voyage-timing path unchanged).
+NUM_VACATION_DEPARTURE_BUFFER_HOURS = "vacation_departure_buffer_hours"
+DEFAULT_VACATION_DEPARTURE_BUFFER_HOURS = 2.0
+
 # (key, default, unit, min, max, step, icon, category, name)
 NUMBER_DEFINITIONS: tuple[tuple, ...] = (
     (NUM_BATTERY_SIZE_KWH, DEFAULT_BATTERY_SIZE_KWH, "kWh", 1, 500, 0.5, "mdi:battery-high", "Battery pack size"),
@@ -174,6 +192,8 @@ NUMBER_DEFINITIONS: tuple[tuple, ...] = (
     (NUM_IS_DRAWING_ANY_POWER_THRESHOLD_W, DEFAULT_IS_DRAWING_ANY_POWER_THRESHOLD_W, "W", 0, 5000, 10, "mdi:power-plug-outline", "Any-draw-detected threshold"),
     (NUM_HIGH_SHORE_LOAD_THRESHOLD_W, DEFAULT_HIGH_SHORE_LOAD_THRESHOLD_W, "W", 0, 5000, 10, "mdi:power-plug", "High shore-load threshold"),
     (NUM_SOC_CRITICAL_PERCENT, DEFAULT_SOC_CRITICAL_PERCENT, "%", 0, 100, 1, "mdi:battery-alert", "Critical SoC threshold"),
+    (NUM_VACATION_DEPARTURE_TARGET_DAYS, DEFAULT_VACATION_DEPARTURE_TARGET_DAYS, "d", 1, 15, 1, "mdi:calendar-clock", "Vacation departure runway (days)"),
+    (NUM_VACATION_DEPARTURE_BUFFER_HOURS, DEFAULT_VACATION_DEPARTURE_BUFFER_HOURS, "h", 0, 12, 0.5, "mdi:timer-sand", "Vacation departure buffer"),
 )
 
 # system_status string values - kept identical to the original sensor so

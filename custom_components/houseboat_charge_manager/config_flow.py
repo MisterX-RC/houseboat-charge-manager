@@ -78,17 +78,21 @@ class HouseboatChargeManagerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)
     @staticmethod
     @callback
     def async_get_options_flow(config_entry: config_entries.ConfigEntry) -> config_entries.OptionsFlow:
-        return HouseboatChargeManagerOptionsFlow(config_entry)
+        return HouseboatChargeManagerOptionsFlow()
 
 
 class HouseboatChargeManagerOptionsFlow(config_entries.OptionsFlow):
     """Lets the entities be re-pointed later without removing/re-adding the
     integration. Number (tunable) entities are edited directly as regular
     `number` entities, not here.
-    """
 
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
-        self.config_entry = config_entry
+    Deliberately has NO __init__ / does not set self.config_entry itself.
+    Home Assistant's OptionsFlow base class provides self.config_entry
+    automatically. Setting it manually (the pattern every tutorial used for
+    years) now throws on recent Home Assistant Core versions, because it
+    became a read-only property - that's what caused "Config flow could not
+    be loaded: 500 Internal Server Error" when opening Reconfigure/Options.
+    """
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> config_entries.ConfigFlowResult:
         if user_input is not None:

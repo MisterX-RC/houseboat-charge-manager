@@ -60,6 +60,8 @@ from .const import (
     NUM_SOC_FLOOR_PERCENT,
     NUM_UNPLANNED_TARGET_BUFFER_PERCENT,
     NUM_VACATION_CEILING_PERCENT,
+    NUM_VACATION_DEPARTURE_BUFFER_HOURS,
+    NUM_VACATION_DEPARTURE_TARGET_DAYS,
     NUM_VACATION_FLOOR_PERCENT,
     NUM_VOYAGE_APPROACH_BUFFER_HOURS,
     NUM_VOYAGE_IDLE_SETTLE_HOURS,
@@ -104,6 +106,7 @@ PERSISTED_KEYS = (
     "charge_session_ended_at",
     "is_charging",
     "is_within_post_charge_lock",
+    "is_grid_unavailable",
 )
 
 _DATETIME_KEYS = (
@@ -244,6 +247,31 @@ def compute(
     r["units_left"] = units_left
 
     # ---------------------------------------------------------------
+    # VACATION DEPARTURE TARGET (dynamic day-based target that replaces
+    # the fixed vacation ceiling - computed early because the voyage
+    # timing section below needs it). vacation_departure_target_days is a
+    # whole number of days of usable energy (above the low-battery floor)
+    # required at departure time; the default (15) is chosen to always
+    # saturate to 100%, so a lower, limited target is an opt-in. The
+    # buffer hours are added on top as extra kWh, to cover consumption
+    # during the buffer window between "charging finished" and the actual
+    # departure (the matching time-shift lives in DYNAMIC VOYAGE TIMING).
+    # ---------------------------------------------------------------
+    vacation_departure_target_days = float(T[NUM_VACATION_DEPARTURE_TARGET_DAYS])
+    vacation_departure_buffer_hours = float(T[NUM_VACATION_DEPARTURE_BUFFER_HOURS])
+    r["vacation_departure_target_days"] = vacation_departure_target_days
+    r["vacation_departure_buffer_hours"] = vacation_departure_buffer_hours
+
+    percent_per_hour_of_load = (((avg_load_w / 1000) / battery_size) * 100) if battery_size > 0 else 0.0
+    required_runway_percent = vacation_departure_target_days * 24 * percent_per_hour_of_load
+    departure_buffer_percent = vacation_departure_buffer_hours * percent_per_hour_of_load
+    raw_vacation_departure_target_percent = low_battery_percentage + required_runway_percent + departure_buffer_percent
+    vacation_departure_target_percent = round(
+        min(max(raw_vacation_departure_target_percent, low_battery_percentage), 100.0), 2
+    )
+    r["vacation_departure_target_percent"] = vacation_departure_target_percent
+
+    # ---------------------------------------------------------------
     # SIMPLE LIVE DECISION FLAGS
     # ---------------------------------------------------------------
     is_drawing_any_power = shore_power_w > T[NUM_IS_DRAWING_ANY_POWER_THRESHOLD_W]
@@ -282,6 +310,17 @@ def compute(
     is_voyage_pending = start_voyage_hours > 0
     r["is_voyage_pending"] = is_voyage_pending
 
+    # Edge-triggered (not level-triggered): the departure countdown can
+    # legitimately sit at 0 for a long time while shore power stays
+    # connected and nothing is pending, so the reset may only fire the
+    # instant the grid actually becomes unavailable - not continuously
+    # for as long as both conditions happen to hold.
+    was_grid_unavailable = pb("is_grid_unavailable", False)
+    should_reset_vacation_departure_target_days = (
+        is_grid_unavailable and not was_grid_unavailable and start_voyage_hours == 0
+    )
+    r["should_reset_vacation_departure_target_days"] = should_reset_vacation_departure_target_days
+
     prev_voyage_idle_since = pdt("voyage_idle_since")
     if is_voyage_pending:
         voyage_idle_since = None
@@ -306,9 +345,22 @@ def compute(
     # ---------------------------------------------------------------
     # DYNAMIC VOYAGE TIMING
     # ---------------------------------------------------------------
-    kwh_to_full = max(battery_size - battery_energy, 0.0)
+    # In vacation mode, aim the deadline math at the real (possibly lower)
+    # day-based target instead of always assuming a full 100% charge -
+    # otherwise a deliberately lower target would still force charging to
+    # start as early as a full charge would, defeating the point of
+    # setting it lower. Outside vacation mode this is unchanged (always
+    # a full charge).
+    if is_vacation_mode:
+        voyage_target_energy = round(battery_size * (vacation_departure_target_percent / 100), 2)
+    else:
+        voyage_target_energy = battery_size
+    kwh_to_full = max(voyage_target_energy - battery_energy, 0.0)
     charge_hours = (kwh_to_full / battery_charge_speed) if battery_charge_speed > 0 else 0.0
-    dynamic_voyage_charge_hours = round(charge_hours + T[NUM_VOYAGE_SETTLE_MARGIN_HOURS], 2)
+    voyage_settle_margin_hours = T[NUM_VOYAGE_SETTLE_MARGIN_HOURS] + (
+        vacation_departure_buffer_hours if is_vacation_mode else 0.0
+    )
+    dynamic_voyage_charge_hours = round(charge_hours + voyage_settle_margin_hours, 2)
     r["dynamic_voyage_charge_hours"] = dynamic_voyage_charge_hours
 
     voyage_approach_trigger_hours = dynamic_voyage_charge_hours + T[NUM_VOYAGE_APPROACH_BUFFER_HOURS]
@@ -384,21 +436,43 @@ def compute(
     # ---------------------------------------------------------------
     # VACATION BAND
     # ---------------------------------------------------------------
+    # vacation_floor_percent/vacation_ceiling_percent configure the WIDTH
+    # of the start/stop band (default 90-70 = 20 points of hysteresis),
+    # not fixed absolute levels any more: in vacation mode the ceiling is
+    # now the dynamic vacation_departure_target_percent, and the floor
+    # trails it by that same configured width.
     vacation_floor = float(T[NUM_VACATION_FLOOR_PERCENT])
     vacation_ceiling = float(T[NUM_VACATION_CEILING_PERCENT])
-    r["vacation_charge_floor_percentage"] = vacation_floor
-    r["vacation_charge_ceiling_percentage"] = vacation_ceiling
-    is_vacation_soc_low = soc < vacation_floor
-    is_vacation_soc_full = soc >= vacation_ceiling
+    vacation_band_width = max(vacation_ceiling - vacation_floor, 0.0)
+    if is_vacation_mode:
+        effective_vacation_ceiling = vacation_departure_target_percent
+        effective_vacation_floor = max(effective_vacation_ceiling - vacation_band_width, 0.0)
+    else:
+        effective_vacation_ceiling = vacation_ceiling
+        effective_vacation_floor = vacation_floor
+    r["vacation_charge_floor_percentage"] = effective_vacation_floor
+    r["vacation_charge_ceiling_percentage"] = effective_vacation_ceiling
+    is_vacation_soc_low = soc < effective_vacation_floor
+    is_vacation_soc_full = soc >= effective_vacation_ceiling
     r["is_vacation_soc_low"] = is_vacation_soc_low
     r["is_vacation_soc_full"] = is_vacation_soc_full
 
     # ---------------------------------------------------------------
     # CHARGE TARGET
     # ---------------------------------------------------------------
-    if effective_full_charge_cycle:
+    # Calibration always wins (battery-health balancing is independent of
+    # vacation mode). Otherwise, in vacation mode the dynamic day-based
+    # target IS the target - at every stage (idle topping-off, voyage
+    # approach, voyage final-due/hold) - which is what lets a lower
+    # day-count actually limit charging instead of being overridden back
+    # to a flat 95/100 once a departure gets close.
+    if is_calibration_cycle:
         target_charge_percentage = 100
-    elif (is_voyage_pending and not is_vacation_mode) or is_voyage_approach_due:
+    elif is_vacation_mode:
+        target_charge_percentage = vacation_departure_target_percent
+    elif effective_full_charge_cycle or is_voyage_approach_due:
+        target_charge_percentage = 100 if effective_full_charge_cycle else 95
+    elif is_voyage_pending:
         target_charge_percentage = 95
     else:
         target_charge_percentage = 90
