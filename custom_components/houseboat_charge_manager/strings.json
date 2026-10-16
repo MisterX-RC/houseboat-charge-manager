@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "Houseboat Charge Manager",
-        "description": "Pick every entity the charge planner needs. All of them are required - this mirrors the entities the original template sensor had hardcoded.",
+        "description": "Pick every entity the charge planner needs. The entities above the scripts/notify fields are all required - this mirrors the entities the original template sensor had hardcoded. The aan/afkoppel scripts and notification targets below that are optional.",
         "data": {
           "name": "Name",
           "battery_soc_entity": "Battery SoC sensor",
@@ -19,7 +19,10 @@
           "low_battery_percentage_entity": "Low-battery floor percentage (input_number)",
           "vacation_mode_entity": "Vacation mode switch (input_boolean)",
           "force_full_charge_entity": "Force-100% override switch (input_boolean)",
-          "grid_switch_entity": "Shore power relay/switch"
+          "grid_switch_entity": "Shore power relay/switch",
+          "start_charge_script_entity": "Connect shore power script (optional)",
+          "stop_charge_script_entity": "Disconnect shore power script (optional)",
+          "notify_targets": "Notification targets (optional, pick one or more)"
         }
       }
     },
@@ -49,7 +52,10 @@
           "low_battery_percentage_entity": "Low-battery floor percentage (input_number)",
           "vacation_mode_entity": "Vacation mode switch (input_boolean)",
           "force_full_charge_entity": "Force-100% override switch (input_boolean)",
-          "grid_switch_entity": "Shore power relay/switch"
+          "grid_switch_entity": "Shore power relay/switch",
+          "start_charge_script_entity": "Connect shore power script (optional)",
+          "stop_charge_script_entity": "Disconnect shore power script (optional)",
+          "notify_targets": "Notification targets (optional, pick one or more)"
         }
       }
     }

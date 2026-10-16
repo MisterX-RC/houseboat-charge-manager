@@ -25,14 +25,18 @@ from .const import (
     CONF_FORCE_FULL_CHARGE_ENTITY,
     CONF_GRID_SWITCH_ENTITY,
     CONF_LOW_BATTERY_PERCENTAGE_ENTITY,
+    CONF_NOTIFY_TARGETS,
     CONF_PRICE_14D_AVERAGE_ENTITY,
     CONF_PRICE_ENTITY,
     CONF_SHORE_POWER_ENTITY,
+    CONF_START_CHARGE_SCRIPT_ENTITY,
     CONF_START_VOYAGE_ENTITY,
+    CONF_STOP_CHARGE_SCRIPT_ENTITY,
     CONF_VACATION_MODE_ENTITY,
     CONF_WALSTROOM_REQUESTED_ENTITY,
     DEFAULT_VACATION_DEPARTURE_TARGET_DAYS,
     DOMAIN,
+    NOTIFICATION_MESSAGES,
     NUM_VACATION_DEPARTURE_TARGET_DAYS,
     NUMBER_DEFINITIONS,
     STORAGE_KEY_SUFFIX,
@@ -156,6 +160,46 @@ class HouseboatChargeManagerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _conf(self, key: str) -> str | None:
         return {**self.entry.data, **self.entry.options}.get(key)
 
+    async def _async_handle_charge_action(self, result: dict[str, Any]) -> None:
+        """Fires the configured aan/afkoppel script + notification on the
+        exact cycle system_status enters "Start charge"/"100% mode" or
+        "Stop charge" (see logic.py's is_connect_triggered/
+        is_disconnect_triggered). Both are no-ops if nothing is configured
+        for them - this feature is entirely optional.
+        """
+        reason_text = NOTIFICATION_MESSAGES.get(result.get("charge_action_reason"), "")
+        if result.get("is_connect_triggered"):
+            await self._async_trigger_script(self._conf(CONF_START_CHARGE_SCRIPT_ENTITY))
+            await self._async_send_notifications("Walstroom - Aankoppelen", f"Aankoppelen: {reason_text}")
+        elif result.get("is_disconnect_triggered"):
+            await self._async_trigger_script(self._conf(CONF_STOP_CHARGE_SCRIPT_ENTITY))
+            await self._async_send_notifications("Walstroom - Afkoppelen", f"Afkoppelen: {reason_text}")
+
+    async def _async_trigger_script(self, script_entity_id: str | None) -> None:
+        if not script_entity_id:
+            return
+        try:
+            await self.hass.services.async_call(
+                "script", "turn_on", {"entity_id": script_entity_id}, blocking=False
+            )
+        except Exception as err:  # noqa: BLE001 - a script failure must never break the coordinator
+            _LOGGER.warning("Houseboat Charge Manager: could not call %s: %s", script_entity_id, err)
+
+    async def _async_send_notifications(self, title: str, message: str) -> None:
+        targets = self._conf(CONF_NOTIFY_TARGETS) or []
+        if isinstance(targets, str):
+            targets = [targets]
+        for entity_id in targets:
+            try:
+                await self.hass.services.async_call(
+                    "notify",
+                    "send_message",
+                    {"entity_id": entity_id, "title": title, "message": message},
+                    blocking=False,
+                )
+            except Exception as err:  # noqa: BLE001 - a notify failure must never break the coordinator
+                _LOGGER.warning("Houseboat Charge Manager: could not notify %s: %s", entity_id, err)
+
     async def _async_update_data(self) -> dict[str, Any]:
         hass = self.hass
         now = dt_util.now()
@@ -220,6 +264,8 @@ class HouseboatChargeManagerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             await self._async_reset_number_to_default(
                 NUM_VACATION_DEPARTURE_TARGET_DAYS, DEFAULT_VACATION_DEPARTURE_TARGET_DAYS
             )
+
+        await self._async_handle_charge_action(result)
 
         self._prev = result
         await self._store.async_save(logic.serialize_prev(result))

@@ -55,6 +55,16 @@ CONF_FORCE_FULL_CHARGE_ENTITY = "force_full_charge_entity"
 # (grid physically absent), same as the original's is_grid_unavailable.
 CONF_GRID_SWITCH_ENTITY = "grid_switch_entity"
 
+# ---------------------------------------------------------------------------
+# Config entry keys - optional aan/afkoppel scripts + notification targets.
+# Unlike the entities above, these are NOT required: leaving them unset
+# simply means the integration doesn't call a script or send a
+# notification, everything else keeps working the same.
+# ---------------------------------------------------------------------------
+CONF_START_CHARGE_SCRIPT_ENTITY = "start_charge_script_entity"
+CONF_STOP_CHARGE_SCRIPT_ENTITY = "stop_charge_script_entity"
+CONF_NOTIFY_TARGETS = "notify_targets"
+
 REQUIRED_ENTITY_KEYS = (
     CONF_BATTERY_SOC_ENTITY,
     CONF_BATTERY_VOLTAGE_ENTITY,
@@ -205,3 +215,34 @@ STATUS_ACTIEF = "Actief"
 STATUS_STOP_CHARGE = "Stop charge"
 STATUS_COOLDOWN = "Cooldown"
 STATUS_WAIT_FOR_START = "Wait for start"
+
+# ---------------------------------------------------------------------------
+# Aan-/afkoppel-script notifications - why charging was just started/
+# stopped. REASON_* are machine keys set by logic.py's state machine;
+# NOTIFICATION_MESSAGES maps each to the Dutch text that goes after
+# "Aankoppelen:"/"Afkoppelen:" in the notification sent when the
+# configured script fires (see coordinator.py).
+# ---------------------------------------------------------------------------
+REASON_FORCE_FULL_CHARGE = "force_full_charge"
+REASON_PRICE_NEGATIVE = "price_negative"
+REASON_VOYAGE_DEADLINE = "voyage_deadline"
+REASON_VACATION_LOW_SOC = "vacation_low_soc"
+REASON_PLANNED_WINDOW = "planned_window"
+REASON_SOC_CRITICAL = "soc_critical"
+REASON_VACATION_TARGET_REACHED = "vacation_target_reached"
+REASON_UNPLANNED_TARGET_REACHED = "unplanned_target_reached"
+REASON_CHARGE_COMPLETE = "charge_complete"
+REASON_DURATION_ELAPSED = "duration_elapsed"
+
+NOTIFICATION_MESSAGES: dict[str, str] = {
+    REASON_FORCE_FULL_CHARGE: "handmatige 100%-modus ingeschakeld",
+    REASON_PRICE_NEGATIVE: "stroomprijs is negatief",
+    REASON_VOYAGE_DEADLINE: "opladen voor de geplande vertrektijd",
+    REASON_VACATION_LOW_SOC: "accu onder de vakantie-ondergrens",
+    REASON_PLANNED_WINDOW: "geplande goedkope laadvenster begint",
+    REASON_SOC_CRITICAL: "accu kritiek laag",
+    REASON_VACATION_TARGET_REACHED: "vakantie-laaddoel bereikt",
+    REASON_UNPLANNED_TARGET_REACHED: "laaddoel bereikt",
+    REASON_CHARGE_COMPLETE: "laadsessie afgerond (vol en gebalanceerd)",
+    REASON_DURATION_ELAPSED: "geplande laadtijd verstreken",
+}

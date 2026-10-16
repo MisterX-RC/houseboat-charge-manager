@@ -1,7 +1,10 @@
 """Config flow: pick every external entity the original sensor hardcoded.
-A single step is enough here (14 entities) - unlike a multi-source energy
-planner, every one of these is required for the calculation to mean
-anything, so there is no meaningful "skip this part" path to branch on.
+A single step is enough here - the 14 core entities are all required,
+unlike a multi-source energy planner, every one of these is required for
+the calculation to mean anything, so there is no meaningful "skip this
+part" path to branch on. The aan/afkoppel scripts and notification
+targets added after that are the one genuinely optional part: leaving
+them unset just means the integration doesn't call a script or notify.
 """
 from __future__ import annotations
 
@@ -22,10 +25,13 @@ from .const import (
     CONF_GRID_SWITCH_ENTITY,
     CONF_LOW_BATTERY_PERCENTAGE_ENTITY,
     CONF_NAME,
+    CONF_NOTIFY_TARGETS,
     CONF_PRICE_14D_AVERAGE_ENTITY,
     CONF_PRICE_ENTITY,
     CONF_SHORE_POWER_ENTITY,
+    CONF_START_CHARGE_SCRIPT_ENTITY,
     CONF_START_VOYAGE_ENTITY,
+    CONF_STOP_CHARGE_SCRIPT_ENTITY,
     CONF_VACATION_MODE_ENTITY,
     CONF_WALSTROOM_REQUESTED_ENTITY,
     DEFAULT_NAME,
@@ -50,6 +56,15 @@ _ENTITY_FIELDS: tuple[tuple[str, list[str]], ...] = (
     (CONF_GRID_SWITCH_ENTITY, ["switch"]),
 )
 
+# Optional: calling these out is what lets the integration trigger the
+# actual walstroom connect/disconnect and notify about it (see
+# coordinator.py) - left unset, nothing calls a script or sends a
+# notification, everything else keeps working the same.
+_OPTIONAL_ENTITY_FIELDS: tuple[tuple[str, list[str]], ...] = (
+    (CONF_START_CHARGE_SCRIPT_ENTITY, ["script"]),
+    (CONF_STOP_CHARGE_SCRIPT_ENTITY, ["script"]),
+)
+
 
 def _entities_schema(defaults: dict[str, Any]) -> vol.Schema:
     fields: dict[Any, Any] = {}
@@ -60,6 +75,19 @@ def _entities_schema(defaults: dict[str, Any]) -> vol.Schema:
             fields[vol.Required(key, default=default)] = selector.EntitySelector(selector_config)
         else:
             fields[vol.Required(key)] = selector.EntitySelector(selector_config)
+    for key, domains in _OPTIONAL_ENTITY_FIELDS:
+        selector_config = selector.EntitySelectorConfig(domain=domains)
+        default = defaults.get(key)
+        if default:
+            fields[vol.Optional(key, default=default)] = selector.EntitySelector(selector_config)
+        else:
+            fields[vol.Optional(key)] = selector.EntitySelector(selector_config)
+    notify_default = defaults.get(CONF_NOTIFY_TARGETS)
+    notify_selector = selector.EntitySelector(selector.EntitySelectorConfig(domain=["notify"], multiple=True))
+    if notify_default:
+        fields[vol.Optional(CONF_NOTIFY_TARGETS, default=notify_default)] = notify_selector
+    else:
+        fields[vol.Optional(CONF_NOTIFY_TARGETS)] = notify_selector
     return vol.Schema(fields)
 
 

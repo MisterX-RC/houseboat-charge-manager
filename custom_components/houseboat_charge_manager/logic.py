@@ -67,6 +67,16 @@ from .const import (
     NUM_VOYAGE_IDLE_SETTLE_HOURS,
     NUM_VOYAGE_POST_DEADLINE_HOLD_HOURS,
     NUM_VOYAGE_SETTLE_MARGIN_HOURS,
+    REASON_CHARGE_COMPLETE,
+    REASON_DURATION_ELAPSED,
+    REASON_FORCE_FULL_CHARGE,
+    REASON_PLANNED_WINDOW,
+    REASON_PRICE_NEGATIVE,
+    REASON_SOC_CRITICAL,
+    REASON_UNPLANNED_TARGET_REACHED,
+    REASON_VACATION_LOW_SOC,
+    REASON_VACATION_TARGET_REACHED,
+    REASON_VOYAGE_DEADLINE,
     STATUS_100_PERCENT_MODE,
     STATUS_ACTIEF,
     STATUS_COOLDOWN,
@@ -79,6 +89,11 @@ from .const import (
 UNIT_MINUTES = 15
 UNITS_PER_HOUR = 60 // UNIT_MINUTES  # 4
 UNITS_PER_DAY = 24 * UNITS_PER_HOUR  # 96
+
+# Both mean "we want shore power connected" - "100% mode" bypasses the
+# normal charge-need logic entirely, so it must trigger the connect script
+# itself rather than relying on also reaching "Start charge".
+_CONNECT_STATUSES = (STATUS_START_CHARGE, STATUS_100_PERCENT_MODE)
 
 # Keys whose previous-cycle value must survive a Home Assistant restart.
 # Excludes the large per-cycle arrays (all_price/interval_price/
@@ -107,6 +122,7 @@ PERSISTED_KEYS = (
     "is_charging",
     "is_within_post_charge_lock",
     "is_grid_unavailable",
+    "system_status",
 )
 
 _DATETIME_KEYS = (
@@ -943,18 +959,27 @@ def compute(
     # ---------------------------------------------------------------
     # STATE MACHINE
     # ---------------------------------------------------------------
+    # charge_action_reason is set alongside every branch that enters
+    # STATUS_START_CHARGE / STATUS_100_PERCENT_MODE / STATUS_STOP_CHARGE -
+    # it's what drives the aan/afkoppel-script notification text below.
+    # None everywhere else (nothing to report).
+    charge_action_reason: str | None = None
     if is_grid_unavailable:
         system_status = STATUS_STANDBY
     elif is_100_percent_mode:
         system_status = STATUS_100_PERCENT_MODE
+        charge_action_reason = REASON_FORCE_FULL_CHARGE
     elif is_price_negative and not is_drawing_any_power and not is_vacation_mode:
         system_status = STATUS_START_CHARGE
+        charge_action_reason = REASON_PRICE_NEGATIVE
     elif is_price_negative and is_drawing_any_power and not is_vacation_mode:
         system_status = STATUS_ACTIEF
     elif (is_voyage_hold_active or (is_voyage_approach_due and has_charge_need)) and not is_charging:
         system_status = STATUS_START_CHARGE
+        charge_action_reason = REASON_VOYAGE_DEADLINE
     elif is_charging and is_vacation_mode and is_vacation_soc_full and not is_voyage_charge_forced:
         system_status = STATUS_STOP_CHARGE
+        charge_action_reason = REASON_VACATION_TARGET_REACHED
     elif (
         is_charging
         and not is_vacation_mode
@@ -964,8 +989,10 @@ def compute(
         and is_unplanned_target_reached
     ):
         system_status = STATUS_STOP_CHARGE
+        charge_action_reason = REASON_UNPLANNED_TARGET_REACHED
     elif is_charging and is_charge_complete and not is_voyage_hold_active and r["completion_ends_session"]:
         system_status = STATUS_STOP_CHARGE
+        charge_action_reason = REASON_CHARGE_COMPLETE
     elif (
         is_charging
         and is_duration_elapsed
@@ -973,20 +1000,41 @@ def compute(
         and (not effective_full_charge_cycle or not charge_plan_voltage_target_reached)
     ):
         system_status = STATUS_STOP_CHARGE
+        charge_action_reason = REASON_DURATION_ELAPSED
     elif is_charging:
         system_status = STATUS_ACTIEF
     elif is_within_cooldown:
         system_status = STATUS_COOLDOWN
     elif is_vacation_mode and is_vacation_soc_low:
         system_status = STATUS_START_CHARGE
+        charge_action_reason = REASON_VACATION_LOW_SOC
     elif not is_vacation_mode and best_window_starts_now and has_charge_need and is_price_favorable:
         system_status = STATUS_START_CHARGE
+        charge_action_reason = REASON_PLANNED_WINDOW
     elif not is_vacation_mode and best_window_starts_now and has_charge_need and is_soc_critical:
         system_status = STATUS_START_CHARGE
+        charge_action_reason = REASON_SOC_CRITICAL
     elif not is_vacation_mode and has_charge_need and (is_price_favorable or is_soc_critical_at_window_start):
         system_status = STATUS_WAIT_FOR_START
     else:
         system_status = STATUS_STANDBY
+    r["charge_action_reason"] = charge_action_reason
+
+    # Edge-triggered (same reasoning as should_reset_vacation_departure_
+    # target_days above): the aan/afkoppel-scripts must fire once, on the
+    # cycle the status actually changes - not every cycle the status
+    # happens to still read "Start charge"/"100% mode"/"Stop charge".
+    # "Start charge" and "100% mode" both mean "we want it connected" (see
+    # CHANGELOG) - physically plugging in shore power already connects it
+    # regardless of these scripts (safety default), so this can also fire
+    # straight into STATUS_STOP_CHARGE with no prior "Start charge" at all
+    # (e.g. plugging in with no charge need) - that's intentional, not a
+    # bug: the afkoppel-script is exactly what undoes that.
+    was_system_status = P.get("system_status")
+    is_connect_triggered = system_status in _CONNECT_STATUSES and was_system_status not in _CONNECT_STATUSES
+    is_disconnect_triggered = system_status == STATUS_STOP_CHARGE and was_system_status != STATUS_STOP_CHARGE
+    r["is_connect_triggered"] = is_connect_triggered
+    r["is_disconnect_triggered"] = is_disconnect_triggered
     r["system_status"] = system_status
 
     return r

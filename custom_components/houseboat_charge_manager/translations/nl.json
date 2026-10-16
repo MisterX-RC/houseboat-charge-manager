@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "Houseboat Charge Manager",
-        "description": "Kies elke entiteit die de laadplanner nodig heeft. Alles is verplicht - dit zijn dezelfde entiteiten die de originele template-sensor hardcoded had.",
+        "description": "Kies elke entiteit die de laadplanner nodig heeft. De entiteiten boven de scripts/notificaties zijn verplicht - dit zijn dezelfde entiteiten die de originele template-sensor hardcoded had. De aan-/afkoppel-scripts en notificatiedoelen daaronder zijn optioneel.",
         "data": {
           "name": "Naam",
           "battery_soc_entity": "Accu SoC-sensor",
@@ -19,7 +19,10 @@
           "low_battery_percentage_entity": "Low-battery-vloer percentage (input_number)",
           "vacation_mode_entity": "Vakantiemodus-schakelaar (input_boolean)",
           "force_full_charge_entity": "Forceer-100%-override-schakelaar (input_boolean)",
-          "grid_switch_entity": "Walstroom-relais/schakelaar"
+          "grid_switch_entity": "Walstroom-relais/schakelaar",
+          "start_charge_script_entity": "Script: walstroom aankoppelen (optioneel)",
+          "stop_charge_script_entity": "Script: walstroom afkoppelen (optioneel)",
+          "notify_targets": "Notificatiedoelen (optioneel, een of meer kiezen)"
         }
       }
     },
@@ -49,7 +52,10 @@
           "low_battery_percentage_entity": "Low-battery-vloer percentage (input_number)",
           "vacation_mode_entity": "Vakantiemodus-schakelaar (input_boolean)",
           "force_full_charge_entity": "Forceer-100%-override-schakelaar (input_boolean)",
-          "grid_switch_entity": "Walstroom-relais/schakelaar"
+          "grid_switch_entity": "Walstroom-relais/schakelaar",
+          "start_charge_script_entity": "Script: walstroom aankoppelen (optioneel)",
+          "stop_charge_script_entity": "Script: walstroom afkoppelen (optioneel)",
+          "notify_targets": "Notificatiedoelen (optioneel, een of meer kiezen)"
         }
       }
     }

@@ -13,6 +13,33 @@ Versions are **year.month.release**, like ESS Manager's own (as of
 the releases in that month from 0 - `2026.10.0`, `2026.10.1`, ...,
 `2026.11.0`.
 
+## [2026.10.3] - 2026-10-16
+
+### Added
+- **Aan-/afkoppel-scripts and notifications.** Two new optional fields in
+  the config flow (and Reconfigure) let you pick a script to run when
+  shore power should connect, and one for when it should disconnect, plus
+  one or more `notify.*` targets to message when either happens. Neither
+  script needs to know *why* it was called - it just connects or
+  disconnects; the integration sends a separate notification (title
+  "Walstroom - Aankoppelen"/"Walstroom - Afkoppelen", message starting
+  with "Aankoppelen:"/"Afkoppelen:") with the actual reason. All three
+  fields are optional - leaving them unset just means no script is
+  called and nothing is notified, everything else is unaffected.
+- The scripts fire on the exact cycle `system_status` enters "Start
+  charge"/"100% mode" (connect) or "Stop charge" (disconnect), not
+  continuously while it stays there. Because shore power physically
+  connects on its own for safety the moment the cable is plugged in
+  (independent of these scripts), this can go straight to "Stop charge"
+  with no prior "Start charge" at all - e.g. plugging in with no charge
+  need - and that's by design: the disconnect script is exactly what
+  undoes an unwanted automatic connection.
+- 10 reasons are recognised: force-100% override, negative price, a
+  pending departure, vacation mode below its floor, a planned cheap
+  window, critical SoC (connect); the vacation target, the unplanned
+  target, a completed/balanced session, and an elapsed planned duration
+  (disconnect).
+
 ## [2026.10.2] - 2026-10-16
 
 ### Added
