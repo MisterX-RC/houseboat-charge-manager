@@ -54,7 +54,9 @@ from .const import (
     NUM_HIGH_SHORE_LOAD_THRESHOLD_W,
     NUM_IS_CHARGING_THRESHOLD_W,
     NUM_IS_DRAWING_ANY_POWER_THRESHOLD_W,
+    NUM_LOW_SOC_SEARCH_HORIZON_HOURS,
     NUM_SESSION_CAP_HOURS,
+    NUM_SESSION_CAP_LOW_SOC_HOURS,
     NUM_SOC_CEILING_PERCENT,
     NUM_SOC_CRITICAL_PERCENT,
     NUM_SOC_FLOOR_PERCENT,
@@ -496,7 +498,20 @@ def compute(
     target_charge_level = round(battery_size * (target_charge_percentage / 100), 2)
     r["target_charge_level"] = target_charge_level
 
-    session_cap_kwh = round((avg_load_w * T[NUM_SESSION_CAP_HOURS]) / 1000, 1)
+    # Two separate session caps, picked by whether the battery is
+    # currently below the "Price-ceiling SoC floor" (soc_floor_percent,
+    # default 40%) - the same threshold the price-ceiling relaxation
+    # below already keys off. Below it, a lower cap (its own tunable, so
+    # it can be set independently of the above-floor one) keeps sessions
+    # short on purpose; at/above it, the normal, usually larger cap
+    # applies. Re-evaluated fresh every cycle - not latched.
+    is_below_soc_floor = soc < float(T[NUM_SOC_FLOOR_PERCENT])
+    r["is_below_soc_floor"] = is_below_soc_floor
+    session_cap_hours = (
+        float(T[NUM_SESSION_CAP_LOW_SOC_HOURS]) if is_below_soc_floor else float(T[NUM_SESSION_CAP_HOURS])
+    )
+    r["session_cap_hours"] = session_cap_hours
+    session_cap_kwh = round((avg_load_w * session_cap_hours) / 1000, 1)
     gap_kwh = max(round(target_charge_level - battery_energy, 1), 0.0)
     charge_kwh = gap_kwh if is_voyage_charge_forced else min(gap_kwh, session_cap_kwh)
     r["charge_kwh"] = charge_kwh
@@ -588,6 +603,16 @@ def compute(
         last_considered_interval_index = min(normal_horizon, voyage_horizon)
     else:
         last_considered_interval_index = normal_horizon
+
+    # Below the SoC floor, deliberately don't let the search roam the full
+    # horizon above: cap it at a short, dedicated number of hours (default
+    # 8h) - or, if the battery would reach low_battery_percentage sooner
+    # than that, at `units_left` instead, same as the pre-2026.10.5
+    # definition (reintroduced here on purpose, scoped to this one case,
+    # not as the general-purpose horizon it used to be).
+    if is_below_soc_floor:
+        low_soc_horizon_units = round(float(T[NUM_LOW_SOC_SEARCH_HORIZON_HOURS]) * UNITS_PER_HOUR)
+        last_considered_interval_index = min(last_considered_interval_index, low_soc_horizon_units, units_left)
     r["last_considered_interval_index"] = last_considered_interval_index
 
     duration = max(charge_time_units, 1)
@@ -658,7 +683,15 @@ def compute(
     r["price_trim_start_index"] = price_trim_start_index
     r["price_trim_duration_units"] = price_trim_duration_units
 
-    if price_limited_start_index >= 0:
+    # Below the SoC floor, the average-price ceiling is no longer
+    # consulted at all - that relaxation exists to patiently trade a
+    # longer wait for a cheaper average price, which is the opposite of
+    # what's wanted here (a short, already tightly-capped session within
+    # a short horizon). Just take the plain cheapest full-duration window
+    # found above.
+    if is_below_soc_floor:
+        start_index = cheapest_start_index
+    elif price_limited_start_index >= 0:
         start_index = price_limited_start_index
     elif price_trim_duration_units < charge_time_units:
         start_index = price_trim_start_index
@@ -666,7 +699,7 @@ def compute(
         start_index = cheapest_start_index
     r["start_index"] = start_index
     effective_duration_units = (
-        charge_time_units if price_limited_start_index >= 0 else price_trim_duration_units
+        charge_time_units if (is_below_soc_floor or price_limited_start_index >= 0) else price_trim_duration_units
     )
     r["effective_duration_units"] = effective_duration_units
     r["low_price"] = min(all_price) if all_price else 0.0
@@ -696,20 +729,26 @@ def compute(
 
     # How much the base (price-ceiling-qualifying, possibly price-trimmed)
     # window delivers on its own - computed here (and reused below as
-    # effective_charge_kwh) because the extension needs it to bound
-    # headroom_kwh correctly: extending must only be allowed to close the
-    # gap between that and the ALREADY-DECIDED charge_kwh (which is
-    # itself session-capped unless is_voyage_charge_forced) - not the raw
-    # gap to the final SoC target. Using the raw target gap here let a
-    # long flat-priced stretch re-inflate the session past the session
-    # cap the user configured (interval_price[start:start+ext_duration]
-    # above still works fine for short windows; this is specifically
-    # about what's left to extend into).
+    # effective_charge_kwh) because the extension needs it as its
+    # starting point: "how much is already granted before any flat-block
+    # extension happens". That can be less than charge_kwh itself when
+    # price-trimming shortened the base window below charge_time_units.
     if effective_duration_units < max(charge_time_units, 1):
         base_charge_kwh = round(max(effective_duration_units, 1) * (battery_charge_speed / 4) * charger_efficiency, 2)
     else:
         base_charge_kwh = charge_kwh
-    headroom_kwh = max(charge_kwh - base_charge_kwh, 0.0)
+
+    # The flat-block extension is deliberately allowed to push PAST the
+    # session cap: the whole point of it is that a long flat/uniformly-
+    # cheap stretch is exactly the situation where taking more energy now
+    # - rather than waiting for another day's separately-capped session -
+    # is the efficient thing to do. So headroom is measured against the
+    # full remaining gap to the SoC target, not against charge_kwh (which
+    # is itself session-capped unless is_voyage_charge_forced). The
+    # session cap still fully governs the BASE window chosen by the
+    # search above; it just doesn't also limit how far a genuinely flat
+    # stretch beyond that base window can be ridden.
+    headroom_kwh = max(target_charge_level - battery_energy - base_charge_kwh, 0.0)
     if battery_charge_speed > 0 and charger_efficiency > 0:
         max_extra_units = math.floor(headroom_kwh / ((battery_charge_speed / 4) * charger_efficiency))
     else:
@@ -767,7 +806,9 @@ def compute(
 
     prev_pending_start_raw = P.get("pending_plan_start_unit")
     prev_pending_start = prev_pending_start_raw if _is_plain_number(prev_pending_start_raw) else None
-    qualifies = (price_limited_start_index >= 0) or (effective_duration_units < charge_time_units)
+    qualifies = (not is_below_soc_floor and price_limited_start_index >= 0) or (
+        effective_duration_units < charge_time_units
+    )
     locked_idx = (int(prev_pending_start) - interval_start_unit) if prev_pending_start is not None else -1
     locked_duration = max(int(pf("pending_plan_duration_units", 0)), 1)
     if 0 <= locked_idx < len(interval_price):

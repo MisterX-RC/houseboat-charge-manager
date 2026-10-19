@@ -147,6 +147,22 @@ DEFAULT_UNPLANNED_TARGET_BUFFER_PERCENT = 10.0
 NUM_SESSION_CAP_HOURS = "session_cap_hours"
 DEFAULT_SESSION_CAP_HOURS = 30.0
 
+# Separate, smaller session cap used only while the battery is below the
+# "Price-ceiling SoC floor" (soc_floor_percent, default 40%) - deliberately
+# its own tunable (not just session_cap_hours again) so the two can be set
+# independently: a comfortably larger cap above the floor, and a shorter
+# one below it to guarantee several short charging blocks instead of one
+# long one when the battery is genuinely getting low.
+NUM_SESSION_CAP_LOW_SOC_HOURS = "session_cap_low_soc_hours"
+DEFAULT_SESSION_CAP_LOW_SOC_HOURS = 10.0
+
+# Below the SoC floor, the window search doesn't roam the full price
+# horizon - it's capped at this many hours (or at units_left, i.e. time
+# until low_battery_percentage, if that's sooner) so it can't wait out a
+# long stretch for a cheaper price while genuinely running low.
+NUM_LOW_SOC_SEARCH_HORIZON_HOURS = "low_soc_search_horizon_hours"
+DEFAULT_LOW_SOC_SEARCH_HORIZON_HOURS = 8.0
+
 NUM_CALIBRATION_GRID_BUFFER_MINUTES = "calibration_grid_buffer_minutes"
 DEFAULT_CALIBRATION_GRID_BUFFER_MINUTES = 120.0
 
@@ -202,7 +218,9 @@ NUMBER_DEFINITIONS: tuple[tuple, ...] = (
     (NUM_VOYAGE_APPROACH_BUFFER_HOURS, DEFAULT_VOYAGE_APPROACH_BUFFER_HOURS, "h", 0, 24, 0.5, "mdi:sail-boat", "Voyage approach buffer"),
     (NUM_VOYAGE_POST_DEADLINE_HOLD_HOURS, DEFAULT_VOYAGE_POST_DEADLINE_HOLD_HOURS, "h", 0, 24, 0.5, "mdi:sail-boat", "Voyage post-deadline hold"),
     (NUM_UNPLANNED_TARGET_BUFFER_PERCENT, DEFAULT_UNPLANNED_TARGET_BUFFER_PERCENT, "%", 0, 50, 1, "mdi:shield-check", "Unplanned-session safety buffer"),
-    (NUM_SESSION_CAP_HOURS, DEFAULT_SESSION_CAP_HOURS, "h", 1, 100, 1, "mdi:clock-outline", "Session energy cap (hours of avg load)"),
+    (NUM_SESSION_CAP_HOURS, DEFAULT_SESSION_CAP_HOURS, "h", 1, 100, 1, "mdi:clock-outline", "Session energy cap - SoC above floor (hours of avg load)"),
+    (NUM_SESSION_CAP_LOW_SOC_HOURS, DEFAULT_SESSION_CAP_LOW_SOC_HOURS, "h", 1, 100, 1, "mdi:clock-alert-outline", "Session energy cap - SoC below floor (hours of avg load)"),
+    (NUM_LOW_SOC_SEARCH_HORIZON_HOURS, DEFAULT_LOW_SOC_SEARCH_HORIZON_HOURS, "h", 1, 48, 0.5, "mdi:magnify-scan", "Search horizon - SoC below floor"),
     (NUM_CALIBRATION_GRID_BUFFER_MINUTES, DEFAULT_CALIBRATION_GRID_BUFFER_MINUTES, "min", 0, 600, 5, "mdi:timer-sand", "Full-charge grid buffer"),
     (NUM_HAS_CHARGE_NEED_THRESHOLD_KWH, DEFAULT_HAS_CHARGE_NEED_THRESHOLD_KWH, "kWh", 0, 20, 0.1, "mdi:battery-charging", "Minimum charge need"),
     (NUM_IS_CHARGING_THRESHOLD_W, DEFAULT_IS_CHARGING_THRESHOLD_W, "W", 0, 5000, 10, "mdi:power-plug", "Charging-detected threshold"),

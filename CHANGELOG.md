@@ -13,6 +13,58 @@ Versions are **year.month.release**, like ESS Manager's own (as of
 the releases in that month from 0 - `2026.10.0`, `2026.10.1`, ...,
 `2026.11.0`.
 
+## [2026.10.8] - 2026-10-19
+
+### Added
+- **A second, lower session cap for when the battery is genuinely low.**
+  Two new `number` entities:
+  - *Session energy cap - SoC below floor* (default 10h) is used instead
+    of the existing *Session energy cap* (now labelled *- SoC above
+    floor*, unchanged, still default 30h) whenever the battery is below
+    the existing *Price-ceiling SoC floor* setting (default 40%) -
+    re-evaluated every cycle, not latched. This lets the two be tuned
+    independently: comfortably larger above the floor, short on purpose
+    below it.
+  - *Search horizon - SoC below floor* (default 8h) caps how far ahead
+    the price search is allowed to look while below the floor - or less,
+    if the battery would hit `low_battery_percentage` sooner than that
+    (same `units_left` calculation removed from the general-purpose
+    horizon in 2026.10.5, reintroduced here scoped to this one case).
+  - Below the floor, the average-price ceiling relaxation
+    (`price_limited_start_index`/the price-trim search) is skipped
+    entirely - deliberately: that mechanism exists to patiently trade a
+    longer wait for a cheaper average price, which is the opposite of
+    the point here. The plain cheapest full-duration window within the
+    short horizon is used instead.
+  - The flat-block extension is unchanged below the floor - a genuinely
+    flat/cheap stretch can still extend a session past this new, shorter
+    cap, same as it can above the floor.
+  - At/above the floor, nothing changes: the existing cap, full horizon,
+    and price-ceiling relaxation all behave exactly as before.
+
+## [2026.10.7] - 2026-10-19
+
+### Fixed
+- **The flat-block extension was no longer allowed to exceed the session
+  cap - that was wrong.** 2026.10.6 bounded the extension's headroom to
+  the session-capped `charge_kwh`, on the mistaken assumption that
+  exceeding the cap was itself the bug. It isn't: the whole point of the
+  flat-block extension is that when prices stay flat/cheap for an
+  extended stretch, charging more right now - rather than waiting for
+  another day's separately-capped session - is the efficient thing to
+  do. Headroom is measured again against the remaining gap to the SoC
+  target, as it was before 2026.10.6, not against the session cap. The
+  session cap still fully governs the *base* window the search picks
+  (so a low battery still doesn't force one huge session trying to hit
+  90%/100% in a single day); it's only the opportunistic extension on
+  top of that base window - which only grows into neighbouring
+  similarly-priced units in the first place - that's allowed to push
+  past it. One genuine refinement survives from 2026.10.6: headroom is
+  measured from what the base window *actually* delivers (which can be
+  slightly less than `charge_kwh` when price-trimming shortened it),
+  not from `charge_kwh` directly - that part was a real, if minor,
+  correctness improvement.
+
 ## [2026.10.6] - 2026-10-18
 
 ### Fixed
