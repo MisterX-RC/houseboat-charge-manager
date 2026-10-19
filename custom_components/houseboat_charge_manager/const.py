@@ -13,7 +13,7 @@ from __future__ import annotations
 DOMAIN = "houseboat_charge_manager"
 DEFAULT_NAME = "Houseboat Charge Manager"
 
-PLATFORMS = ["number", "sensor"]
+PLATFORMS = ["number", "sensor", "switch"]
 
 UPDATE_INTERVAL_SECONDS = 15
 
@@ -64,6 +64,13 @@ CONF_GRID_SWITCH_ENTITY = "grid_switch_entity"
 CONF_START_CHARGE_SCRIPT_ENTITY = "start_charge_script_entity"
 CONF_STOP_CHARGE_SCRIPT_ENTITY = "stop_charge_script_entity"
 CONF_NOTIFY_TARGETS = "notify_targets"
+
+# Unique-id suffix for the switch (switch.py) that turns calling the
+# aan/afkoppel scripts (and their notification) on or off without having
+# to clear the script fields in Reconfigure. Defaults to on, so existing
+# installs keep their current behaviour until the user flips it.
+SWITCH_AUTO_TRIGGER_SCRIPTS = "auto_trigger_scripts"
+DEFAULT_AUTO_TRIGGER_SCRIPTS = True
 
 REQUIRED_ENTITY_KEYS = (
     CONF_BATTERY_SOC_ENTITY,

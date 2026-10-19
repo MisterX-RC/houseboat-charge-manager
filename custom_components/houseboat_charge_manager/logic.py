@@ -568,7 +568,19 @@ def compute(
     # ---------------------------------------------------------------
     # CHEAPEST WINDOW SEARCH
     # ---------------------------------------------------------------
-    normal_horizon = 0 if shore_power_w > T[NUM_HIGH_SHORE_LOAD_THRESHOLD_W] else units_left
+    # The horizon is everything the price sensor currently knows (today +
+    # tomorrow, once published) - NOT units_left (time until usable_energy
+    # hits low_battery_percentage). It used to be units_left, which made
+    # the search give up early and grab a "good enough" nearby price
+    # purely because the battery was getting low - even though patiently
+    # waiting a day for a much cheaper block is fine as long as it isn't
+    # actually approaching low_battery_percentage. That real safety net
+    # doesn't depend on the horizon at all: price_limited_start_index
+    # below already relaxes the acceptable price (via soc_floor/
+    # soc_ceiling) as the projected SoC nears soc_floor, so an early,
+    # not-great-but-acceptable window still gets picked up well before
+    # low_battery_percentage is actually at risk.
+    normal_horizon = 0 if shore_power_w > T[NUM_HIGH_SHORE_LOAD_THRESHOLD_W] else len(interval_price)
     if is_voyage_pending and not is_vacation_mode:
         units_into_hour = interval_start_unit - (now.hour * 4)
         voyage_deadline_units = round(start_voyage_hours * 4) - units_into_hour
@@ -584,10 +596,21 @@ def compute(
     soc_ceiling = float(T[NUM_SOC_CEILING_PERCENT])
     drain_per_unit = battery_drain_rate_percent_per_hour / 4
 
+    # Both loops require a FULL-length window (len(window) == duration),
+    # not merely a non-empty one: interval_price[idx:idx+duration] silently
+    # truncates near the end of the array instead of raising, so without
+    # this check a 2-unit sliver right at the edge of the horizon was
+    # compared on equal footing against genuine full-duration placements -
+    # and, being an average of only its very cheapest couple of units,
+    # would usually "win" even though it doesn't represent a real
+    # placement for a session that actually needs `duration` units of
+    # charging. That's what previously made a long required session latch
+    # onto a tiny sliver far from any real cheap stretch instead of a
+    # genuinely well-priced placement.
     best_average, best_index = 1000.0, -1
     for idx in range(horizon):
         window = interval_price[idx : idx + duration]
-        if not window:
+        if len(window) < duration:
             continue
         window_average = _avg(window)
         if window_average < best_average:
@@ -598,7 +621,7 @@ def compute(
     best_average, best_index = 1000.0, -1
     for idx in range(horizon):
         window = interval_price[idx : idx + duration]
-        if not window:
+        if len(window) < duration:
             continue
         window_average = _avg(window)
         projected_soc = max(soc - drain_per_unit * idx, soc_floor)
@@ -671,7 +694,22 @@ def compute(
     flat_block_price_threshold = max(percentage_threshold, absolute_threshold)
     r["flat_block_price_threshold"] = flat_block_price_threshold
 
-    headroom_kwh = target_charge_level - battery_energy - charge_kwh
+    # How much the base (price-ceiling-qualifying, possibly price-trimmed)
+    # window delivers on its own - computed here (and reused below as
+    # effective_charge_kwh) because the extension needs it to bound
+    # headroom_kwh correctly: extending must only be allowed to close the
+    # gap between that and the ALREADY-DECIDED charge_kwh (which is
+    # itself session-capped unless is_voyage_charge_forced) - not the raw
+    # gap to the final SoC target. Using the raw target gap here let a
+    # long flat-priced stretch re-inflate the session past the session
+    # cap the user configured (interval_price[start:start+ext_duration]
+    # above still works fine for short windows; this is specifically
+    # about what's left to extend into).
+    if effective_duration_units < max(charge_time_units, 1):
+        base_charge_kwh = round(max(effective_duration_units, 1) * (battery_charge_speed / 4) * charger_efficiency, 2)
+    else:
+        base_charge_kwh = charge_kwh
+    headroom_kwh = max(charge_kwh - base_charge_kwh, 0.0)
     if battery_charge_speed > 0 and charger_efficiency > 0:
         max_extra_units = math.floor(headroom_kwh / ((battery_charge_speed / 4) * charger_efficiency))
     else:
@@ -708,10 +746,7 @@ def compute(
     r["planned_charge_time_units"] = planned_charge_time_units
     r["planned_charge_time_hours"] = round(planned_charge_time_units / 4, 2)
 
-    if effective_duration_units < max(charge_time_units, 1):
-        effective_charge_kwh = round(max(effective_duration_units, 1) * (battery_charge_speed / 4) * charger_efficiency, 2)
-    else:
-        effective_charge_kwh = charge_kwh
+    effective_charge_kwh = base_charge_kwh
     r["effective_charge_kwh"] = effective_charge_kwh
 
     planned_charge_kwh = round(

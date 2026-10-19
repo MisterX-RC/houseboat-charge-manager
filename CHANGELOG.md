@@ -13,6 +13,78 @@ Versions are **year.month.release**, like ESS Manager's own (as of
 the releases in that month from 0 - `2026.10.0`, `2026.10.1`, ...,
 `2026.11.0`.
 
+## [2026.10.6] - 2026-10-18
+
+### Fixed
+- **A flat/uniformly-cheap stretch in the price table could blow straight
+  through the Session energy cap.** The forward/backward "flat-block
+  extension" (which opportunistically widens the charge window into
+  neighbouring similarly-priced units) computed its available headroom
+  against the full gap to the SoC target, not against the session cap -
+  so once the chosen window sat inside a long flat-priced block, it kept
+  extending into it well past what the session cap was supposed to
+  allow (confirmed with a synthetic 10-hour flat block: a 10h session
+  cap still produced a planned 10-hour, 15.68 kWh session). It now
+  extends only to close the gap between what the (possibly
+  price-trimmed) base window already delivers and the already-decided,
+  session-capped `charge_kwh` - the same 10h-cap scenario now stays at
+  the capped 4.7 kWh. A real voyage deadline (`is_voyage_charge_forced`)
+  is unaffected - that path was never capped and still extends toward
+  the full target, as it must.
+
+## [2026.10.5] - 2026-10-18
+
+### Fixed
+- **The cheapest-window search could latch onto a misleadingly cheap
+  sliver instead of a genuinely well-priced placement.**
+  `interval_price[idx:idx+duration]` silently truncates near the end of
+  the price data instead of failing, so a tiny 1-2 unit window right at
+  the edge of the search horizon was being compared, average-for-average,
+  against real full-length placements - and, being an average of only its
+  very cheapest couple of units, usually "won" even though it didn't
+  represent an actual placement for a session that needs `duration` units
+  of charging. Both search passes (the plain cheapest window and the
+  price-ceiling-filtered one) now require a full-length window.
+- **The search horizon no longer shrinks just because the battery is
+  below `soc_floor_percent`.** It used to stop looking ahead at
+  `units_left` (time until `usable_energy` hits `low_battery_percentage`)
+  - meaning a battery that was simply below the 40%-ish comfort zone, but
+  nowhere near truly critical, gave up on finding a cheaper price further
+  out and grabbed whatever was "good enough" nearby. The horizon is now
+  everything the price sensor currently knows (today + tomorrow, once
+  published); the existing price-ceiling relaxation (which already eases
+  the acceptable price as the projected SoC nears `soc_floor_percent`)
+  is what keeps this safe - it still picks up a nearby acceptable window
+  well before `low_battery_percentage` is actually at risk.
+
+Together, these two fixes mean a low-battery charge no longer forces one
+long session dragged across both a cheap and an expensive period - it
+finds the real cheapest reasonably-sized window instead. For spreading a
+big catch-up charge (e.g. after a calibration cycle) across several
+*separate*, shorter sessions over several days rather than one long one,
+lower the existing **Session energy cap (hours of avg load)** number
+(default 30h) - a smaller session is much more likely to fit entirely
+inside a single day's cheap window, and the planner will naturally need
+more days to close the same gap.
+
+## [2026.10.4] - 2026-10-16
+
+### Added
+- **"Auto-trigger connect/disconnect scripts" switch.** A new `switch`
+  entity turns calling the configured aan/afkoppel scripts (and sending
+  their notification) on or off, without having to clear the script
+  fields in Reconfigure. Defaults to on, so existing installs keep
+  working exactly as before. Everything else (system_status, the
+  calculation itself) keeps running as normal while it's off - only the
+  script call and its notification are skipped.
+
+### Changed
+- `.github/workflows/validate.yaml` no longer runs the HACS default-list
+  validation job (license/topics/brand-asset checks) - those only matter
+  for submitting this repo to the public HACS store, not for installing
+  it as a "Custom repository", which was producing a permanently red
+  check for no actionable reason. Hassfest validation is unaffected.
+
 ## [2026.10.3] - 2026-10-16
 
 ### Added

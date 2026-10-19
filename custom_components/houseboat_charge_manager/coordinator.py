@@ -34,6 +34,7 @@ from .const import (
     CONF_STOP_CHARGE_SCRIPT_ENTITY,
     CONF_VACATION_MODE_ENTITY,
     CONF_WALSTROOM_REQUESTED_ENTITY,
+    DEFAULT_AUTO_TRIGGER_SCRIPTS,
     DEFAULT_VACATION_DEPARTURE_TARGET_DAYS,
     DOMAIN,
     NOTIFICATION_MESSAGES,
@@ -132,6 +133,10 @@ class HouseboatChargeManagerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # vacation_departure_target_days when shore power drops with no
         # departure pending.
         self._number_entities: dict[str, Any] = {}
+        # Mirrors switch.py's HouseboatAutoTriggerScriptsSwitch - set True
+        # here so a first-ever refresh (before the switch entity exists
+        # yet) still behaves like "on", matching the switch's own default.
+        self._auto_trigger_scripts_enabled: bool = DEFAULT_AUTO_TRIGGER_SCRIPTS
 
     async def async_load_persisted_state(self) -> None:
         stored = await self._store.async_load()
@@ -151,6 +156,11 @@ class HouseboatChargeManagerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def unregister_number_entity(self, key: str) -> None:
         self._number_entities.pop(key, None)
 
+    def set_auto_trigger_scripts_enabled(self, enabled: bool) -> None:
+        """Called by switch.py when the user flips the switch (or on
+        startup, restoring its last state)."""
+        self._auto_trigger_scripts_enabled = enabled
+
     async def _async_reset_number_to_default(self, key: str, default: float) -> None:
         self._number_values[key] = default
         entity = self._number_entities.get(key)
@@ -165,8 +175,14 @@ class HouseboatChargeManagerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         exact cycle system_status enters "Start charge"/"100% mode" or
         "Stop charge" (see logic.py's is_connect_triggered/
         is_disconnect_triggered). Both are no-ops if nothing is configured
-        for them - this feature is entirely optional.
+        for them - this feature is entirely optional - and both are
+        skipped entirely while the "Auto-trigger connect/disconnect
+        scripts" switch (switch.py) is off: calling a script but not the
+        notification describing it (or vice versa) would be misleading,
+        so the switch gates both together.
         """
+        if not self._auto_trigger_scripts_enabled:
+            return
         reason_text = NOTIFICATION_MESSAGES.get(result.get("charge_action_reason"), "")
         if result.get("is_connect_triggered"):
             await self._async_trigger_script(self._conf(CONF_START_CHARGE_SCRIPT_ENTITY))
