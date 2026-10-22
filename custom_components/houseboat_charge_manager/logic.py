@@ -34,7 +34,7 @@ Assistant restart, and calling this function every UPDATE_INTERVAL_SECONDS.
 from __future__ import annotations
 
 import math
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from statistics import mean
 from typing import Any, Optional
 
@@ -111,10 +111,12 @@ PERSISTED_KEYS = (
     "last_full_charge_completed_at",
     "is_charge_complete",
     "pending_plan_start_unit",
+    "pending_plan_reference_date",
     "pending_plan_duration_units",
     "pending_plan_average_price",
     "pending_plan_target_soc",
     "charge_plan_start_unit",
+    "charge_plan_reference_date",
     "charge_plan_duration_units",
     "charge_plan_end_unit",
     "charge_plan_price_limit",
@@ -145,19 +147,56 @@ def _is_plain_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
-def _fmt_unit_clock(unit: int) -> str:
-    """Render an absolute 15-minute unit index (0 = midnight today) as a
-    clock time, prefixed with "Morgen" past unit 96 (tomorrow) - matches
-    the original sensor's start_charge_time/stop_charge_time formatting.
+def _fmt_unit_clock(unit: int, now: datetime) -> str:
+    """Render a 15-minute unit index (0 = midnight of `now`'s date) as a
+    clock time, with a day-aware prefix. Uses real calendar-date math
+    (divmod against `now`'s date), not a single "past unit 96 = tomorrow"
+    check - that only ever handled one day ahead and silently produced
+    garbage for anything further out (now a real possibility - see the
+    flat-block extension) or for a unit that's actually in the past (a
+    locked plan read after it should already be rebased - see
+    _rebase_unit - but this stays correct even if it somehow isn't).
     """
-    if unit > UNITS_PER_DAY:
-        unit -= UNITS_PER_DAY
+    day_offset, unit_of_day = divmod(unit, UNITS_PER_DAY)
+    hour = unit_of_day // UNITS_PER_HOUR
+    minute = (unit_of_day - hour * UNITS_PER_HOUR) * UNIT_MINUTES
+    if day_offset == 0:
+        prefix = ""
+    elif day_offset == 1:
         prefix = "Morgen "
     else:
-        prefix = ""
-    hour = unit // UNITS_PER_HOUR
-    minute = (unit - hour * UNITS_PER_HOUR) * UNIT_MINUTES
+        prefix = f"{(now.date() + timedelta(days=day_offset)).strftime('%d-%m')} "
     return f"{prefix}{hour:02d}:{minute:02d}"
+
+
+def _rebase_unit(value: Optional[float], reference_date_str: Optional[str], now: datetime) -> Optional[float]:
+    """Shift a persisted, day-relative 15-minute unit position (0 =
+    midnight of `reference_date_str`) so it's expressed relative to
+    midnight of `now`'s date instead.
+
+    `interval_start_unit` (and therefore every freshly-computed position -
+    live_start_unit, the search's start_index, ...) is always relative to
+    TODAY's midnight and resets to a small number every local midnight.
+    `pending_plan_start_unit`/`charge_plan_start_unit`, once locked, are
+    instead carried forward unchanged cycle to cycle while a plan is
+    pending or a session is charging - so without this rebase, a plan or
+    session that's still live past midnight gets compared against a
+    completely different day's frame: `interval_start_unit` has reset to
+    ~1, but the locked position hasn't, so e.g. "remaining time" can
+    suddenly jump UP by about a day's worth of units, and the displayed
+    stop time can show the wrong day. Rebasing on every read (not just
+    once) keeps this correct across any number of consecutive midnights.
+    """
+    if value is None:
+        return None
+    if not reference_date_str:
+        return value
+    try:
+        reference_date = date.fromisoformat(reference_date_str)
+    except (TypeError, ValueError):
+        return value
+    days_elapsed = (now.date() - reference_date).days
+    return value if days_elapsed == 0 else value - days_elapsed * UNITS_PER_DAY
 
 
 def serialize_prev(result: dict[str, Any]) -> dict[str, Any]:
@@ -805,7 +844,11 @@ def compute(
     r["is_start_imminent"] = is_start_imminent
 
     prev_pending_start_raw = P.get("pending_plan_start_unit")
-    prev_pending_start = prev_pending_start_raw if _is_plain_number(prev_pending_start_raw) else None
+    prev_pending_start = _rebase_unit(
+        prev_pending_start_raw if _is_plain_number(prev_pending_start_raw) else None,
+        P.get("pending_plan_reference_date"),
+        now,
+    )
     qualifies = (not is_below_soc_floor and price_limited_start_index >= 0) or (
         effective_duration_units < charge_time_units
     )
@@ -839,19 +882,33 @@ def compute(
         pending_plan_duration_units = P.get("pending_plan_duration_units")
         pending_plan_average_price = P.get("pending_plan_average_price")
     r["pending_plan_start_unit"] = pending_plan_start_unit
+    # Always stamped fresh (not just on seed/reseed): whatever value is
+    # being stored this cycle - freshly computed or carried forward from
+    # an already-rebased prev_pending_start - is, by construction,
+    # expressed relative to TODAY's midnight at this point, so today is
+    # always the correct reference date for it.
+    r["pending_plan_reference_date"] = now.date().isoformat()
     r["pending_plan_duration_units"] = pending_plan_duration_units
     r["pending_plan_average_price"] = pending_plan_average_price
 
     # ---------------------------------------------------------------
     # SESSION LOCK-IN
     # ---------------------------------------------------------------
-    prev_charge_plan_start = P.get("charge_plan_start_unit")
+    prev_charge_plan_start_raw = P.get("charge_plan_start_unit")
+    prev_charge_plan_start = _rebase_unit(
+        prev_charge_plan_start_raw if _is_plain_number(prev_charge_plan_start_raw) else None,
+        P.get("charge_plan_reference_date"),
+        now,
+    )
     if is_charging:
         fallback_start = pending_plan_start_unit if pending_plan_start_unit is not None else live_start_unit
         charge_plan_start_unit = prev_charge_plan_start if prev_charge_plan_start is not None else fallback_start
     else:
         charge_plan_start_unit = None
     r["charge_plan_start_unit"] = charge_plan_start_unit
+    # Same reasoning as pending_plan_reference_date above: whatever is
+    # stored this cycle is, by construction, relative to today's midnight.
+    r["charge_plan_reference_date"] = now.date().isoformat() if charge_plan_start_unit is not None else None
 
     prev_charge_plan_duration = P.get("charge_plan_duration_units")
     if is_charging:
@@ -881,7 +938,7 @@ def compute(
     r["start_unit"] = start_unit
 
     is_idle = (not is_charging) and charge_plan_start_unit is None and pending_plan_start_unit is None and not has_charge_need
-    r["start_charge_time"] = "Idle" if is_idle else _fmt_unit_clock(start_unit)
+    r["start_charge_time"] = "Idle" if is_idle else _fmt_unit_clock(start_unit, now)
 
     if is_charging:
         display_duration_units = int(charge_plan_duration_units or 0)
@@ -889,7 +946,7 @@ def compute(
         display_duration_units = int(pending_plan_duration_units)
     else:
         display_duration_units = planned_charge_time_units
-    r["stop_charge_time"] = "Idle" if is_idle else _fmt_unit_clock(start_unit + display_duration_units)
+    r["stop_charge_time"] = "Idle" if is_idle else _fmt_unit_clock(start_unit + display_duration_units, now)
 
     # ---------------------------------------------------------------
     # DYNAMIC PRICE CEILING

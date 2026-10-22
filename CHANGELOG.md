@@ -13,6 +13,30 @@ Versions are **year.month.release**, like ESS Manager's own (as of
 the releases in that month from 0 - `2026.10.0`, `2026.10.1`, ...,
 `2026.11.0`.
 
+## [2026.10.9] - 2026-10-20
+
+### Fixed
+- **A locked charge plan or pending plan that was still live past local
+  midnight showed a wildly wrong remaining time and stop time - "22 hours
+  left" right before it should have finished, a stop time stuck showing
+  "tomorrow afternoon", or the remaining time briefly jumping UP instead
+  of down.** `interval_start_unit` (everything "now"-relative is built
+  from it) resets to a small number every local midnight, but
+  `charge_plan_start_unit`/`pending_plan_start_unit`, once locked, were
+  carried forward across cycles completely unchanged - so once the real
+  clock crossed midnight while one was still active, it was being
+  compared against a different day's frame than the one it was set in,
+  with no adjustment. Each is now paired with its own reference date
+  (`charge_plan_reference_date`/`pending_plan_reference_date`, both new,
+  persisted attributes) and rebased by a whole number of days on every
+  read, so the comparison stays correct no matter how many midnights a
+  locked plan lives through - including a session that (as of 2026.10.7)
+  can legitimately span more than a day.
+- `start_charge_time`/`stop_charge_time` only ever handled "today" or
+  "tomorrow" (anything else produced a nonsensical hour). They're now
+  genuinely day-aware: today, "Morgen" for tomorrow, and an actual
+  `dd-mm` date for anything further out or already in the past.
+
 ## [2026.10.8] - 2026-10-19
 
 ### Added
