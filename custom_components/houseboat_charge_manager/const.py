@@ -258,6 +258,7 @@ REASON_VACATION_TARGET_REACHED = "vacation_target_reached"
 REASON_UNPLANNED_TARGET_REACHED = "unplanned_target_reached"
 REASON_CHARGE_COMPLETE = "charge_complete"
 REASON_DURATION_ELAPSED = "duration_elapsed"
+REASON_SPLIT_PAUSE = "split_pause"
 
 NOTIFICATION_MESSAGES: dict[str, str] = {
     REASON_FORCE_FULL_CHARGE: "handmatige 100%-modus ingeschakeld",
@@ -270,4 +271,5 @@ NOTIFICATION_MESSAGES: dict[str, str] = {
     REASON_UNPLANNED_TARGET_REACHED: "laaddoel bereikt",
     REASON_CHARGE_COMPLETE: "laadsessie afgerond (vol en gebalanceerd)",
     REASON_DURATION_ELAPSED: "geplande laadtijd verstreken",
+    REASON_SPLIT_PAUSE: "sessie gesplitst: pauze voor duurdere prijspiek, hervat automatisch op het geplande tijdstip",
 }

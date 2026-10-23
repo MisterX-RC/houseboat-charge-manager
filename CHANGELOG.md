@@ -13,6 +13,68 @@ Versions are **year.month.release**, like ESS Manager's own (as of
 the releases in that month from 0 - `2026.10.0`, `2026.10.1`, ...,
 `2026.11.0`.
 
+## [2026.10.11] - 2026-10-23
+
+### Added
+- **Split-session charging: a required charging block can now be split in
+  two around an expensive price peak**, instead of always charging one
+  contiguous block straight through it. Example from a real price curve:
+  charging 12:15-16:30 (18 units), skipping the 16:45-20:45 peak, then
+  resuming 21:00-23:45 (12 units) came out 15.8% cheaper overall (avg
+  €0.0993/unit) than the best single contiguous block covering the same
+  duration (avg €0.1178/unit, forced through the peak). The search always
+  splits once it's cheaper - no extra savings threshold - subject to two
+  hard floors: each half must be at least 1 hour (4 units), and the gap
+  between the two halves must be at least one full cooldown period
+  (`cooldown_minutes`), so block B is never due before the reconnect
+  lock-out from block A's stop has actually cleared. Both floors, and
+  "always split when cheaper", were explicit choices made when this was
+  discussed and confirmed.
+  - Only considered in the same case where the search would otherwise
+    charge the full required duration as one block (the ceiling has
+    already justified charging at all) - not below the SoC floor (that
+    mode deliberately ignores price nuance) and not combined with
+    price-trimming or the flat-block extension (different, separate
+    shortening/extension mechanisms this isn't meant to interact with -
+    a chosen split skips the flat-block extension outright, since
+    extending block A could eat into the deliberately-priced-out gap).
+  - Block A's stop (reaching its own planned duration) is a deliberate
+    pause, not the end of the plan - it fires a new `split_pause`
+    notification reason (distinct from "geplande laadtijd verstreken")
+    and, unlike a normal stop, isn't held back by a full-charge/
+    calibration cycle's balance-confirmation guard (that guard protects
+    against ending the *whole* plan before balance is confirmed - a
+    split's pause isn't that, since block B resumes it). Block B's own
+    completion is entirely ordinary once its reservation is consumed,
+    including that same calibration/balance guard where it applies -
+    confirmed with a simulated calibration cycle where block B correctly
+    kept charging well past its own nominal duration, waiting for
+    balance to settle, rather than stopping on duration alone.
+  - Block B's reserved slot is decided once (alongside block A, when
+    that plan locks in) and held fixed - including across a Home
+    Assistant restart - through block A's charging and the pause after
+    it, rather than being re-searched fresh every cycle during the gap
+    (which has no notion of "resume the second half of an already-
+    committed split" and could easily land on something else entirely
+    once the peak itself has come and gone).
+
+### Fixed
+- **Session lock-in could commit to a different duration (and, in
+  principle, start) than what had actually been pending**, on the one
+  cycle a plan actually starts charging. The previous cycle's pending
+  values are cleared (by design) before lock-in runs that same cycle, so
+  lock-in fell back to a fresh recompute instead - usually harmless for
+  the *start* position (by the time "now" reaches it, a fresh search
+  naturally agrees), but not for *duration* whenever the search itself is
+  position-dependent (price-trim, and now a chosen split): a single
+  15-minute step can shift which partition looks optimal, so locking in
+  with a fresh recompute could commit to a visibly different duration
+  than the one actually pending and acted on a moment earlier - first
+  seen as a chosen split committing 16 units instead of the 10 that had
+  just been decided and started on. Lock-in now reads the actual
+  previously-pending value (from persisted store) instead of
+  re-deriving it fresh at the lock-in cycle itself.
+
 ## [2026.10.10] - 2026-10-23
 
 ### Fixed
