@@ -13,6 +13,29 @@ Versions are **year.month.release**, like ESS Manager's own (as of
 the releases in that month from 0 - `2026.10.0`, `2026.10.1`, ...,
 `2026.11.0`.
 
+## [2026.10.10] - 2026-10-23
+
+### Fixed
+- **The price-ceiling window search could pick a more expensive window
+  while a cheaper one sat earlier in the exact same horizon.** Each
+  candidate start position is checked against its own SoC-projected
+  ceiling, which loosens further out (more "urgency" assumed by then) -
+  so a genuinely cheaper window early in the day could fail its own
+  (stricter) ceiling and get skipped, while a pricier window later on,
+  where the ceiling had since loosened, passed and got used instead.
+  Confirmed with a real example: a 7.25h window at 10:45 averaging
+  €0.1115 was rejected (ceiling €0.0997 at that position), while the
+  session ended up starting at 16:45 instead, averaging a higher €0.1177
+  (ceiling €0.1196 there) - even though €0.1115 was plainly the cheaper
+  option and was sitting right there in the same search. Once *any*
+  position's ceiling is satisfied anywhere in the horizon - i.e. charging
+  at roughly that price is justified at all - the search now uses the
+  outright cheapest full-duration window in the horizon instead of
+  whichever one happened to be first to individually clear its own,
+  position-dependent bar. The ceiling itself still fully decides *whether*
+  to accept charging at all (that part is unchanged); it just no longer
+  also decides *which* window, once it's decided yes.
+
 ## [2026.10.9] - 2026-10-20
 
 ### Fixed

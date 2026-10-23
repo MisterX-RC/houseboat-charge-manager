@@ -728,10 +728,26 @@ def compute(
     # what's wanted here (a short, already tightly-capped session within
     # a short horizon). Just take the plain cheapest full-duration window
     # found above.
+    #
+    # When price_limited_start_index >= 0, some position's (SoC-projected)
+    # ceiling was satisfied somewhere in the horizon - i.e. charging at
+    # roughly that price is justified at all. But that candidate was only
+    # ever compared against windows that ALSO passed their own (position-
+    # dependent, generally stricter earlier in the horizon) ceiling - not
+    # against every window outright. cheapest_start_index's average is
+    # always <= price_limited's, by construction (it's the unconditional
+    # minimum over the same full set of full-duration windows), so once
+    # charging is justified at all, the actually-cheapest full-duration
+    # window is also justified - no need to settle for whatever first
+    # cleared its own, possibly-too-strict-for-that-early-position bar.
+    # (Without this, a genuinely cheaper window earlier in the day could
+    # be skipped purely because the SoC-projected ceiling hadn't loosened
+    # enough yet AT THAT position, while a pricier window later - where
+    # the ceiling had since loosened - got used instead.)
     if is_below_soc_floor:
         start_index = cheapest_start_index
     elif price_limited_start_index >= 0:
-        start_index = price_limited_start_index
+        start_index = cheapest_start_index
     elif price_trim_duration_units < charge_time_units:
         start_index = price_trim_start_index
     else:
