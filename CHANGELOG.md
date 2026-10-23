@@ -13,6 +13,116 @@ Versions are **year.month.release**, like ESS Manager's own (as of
 the releases in that month from 0 - `2026.10.0`, `2026.10.1`, ...,
 `2026.11.0`.
 
+## [2026.10.14] - 2026-10-23
+
+### Changed
+- **Flat-block extension for a chosen split now judges and extends each
+  block on its own terms**, instead of only ever touching block A's
+  backward direction (2026.10.13). Per the user's explicit design: each
+  block gets its own average price and threshold (previously block B's
+  own average was computed but silently never used for anything - see
+  Fixed below); the block with the LOWER average is processed first and
+  gets first claim on the one shared headroom budget; each block can
+  extend in BOTH directions, including toward the other block, but
+  extending toward the other block is always capped so a full cooldown
+  period (the same `split_min_gap_units` the split search itself enforces)
+  remains between them - that gap is the entire reason the split exists,
+  so neither block may eat into it from either side. The pricier block is
+  processed second, with its own "toward the other block" limit based on
+  the cheap block's now-settled (possibly already-extended) boundary, not
+  its original search position. New attributes exposed for block B,
+  mirroring block A's existing ones: `split_b_forward_extension_units`,
+  `split_b_backward_extension_units`, `split_b_extension_units`,
+  `split_b_effective_start_index`, `split_b_planned_duration_units` - the
+  dashboard cards and the session-lock-in reservation for block B now both
+  read the EXTENDED window (previously they only ever saw the raw,
+  un-extended search position).
+
+### Fixed
+- **A chosen split's headroom calculation only ever counted block A's own
+  base energy, silently dropping block B's share** (2026.10.11/.13) -
+  `base_charge_kwh` used `effective_duration_units` (block A's duration
+  alone) even though a split's two base blocks together always total the
+  full required `charge_time_units`/`charge_kwh`. This overstated how
+  much "spare" headroom was left for flat-block extension (sometimes by
+  the device's entire base charge), which is what let 2026.10.13's
+  backward-extension fix appear to work in ad hoc testing - the headroom
+  it was riding was partly fictitious. Also silently affected
+  `planned_charge_kwh`/`projected_end_soc` (the dashboard's own "→ NN%"
+  readout) for every split session, which never counted block B's energy
+  at all until now.
+- **`is_split_chosen` could flip to `true` on pure floating-point noise
+  when the split and single-block costs were actually tied** - most
+  visible with a flat or strongly step-shaped price curve (easy to get
+  from a fixed/uniform tariff block, and exactly what several of this
+  project's own test scenarios use), where many different placements of
+  the "overflow" duration cost exactly the same and summation order alone
+  can tip one a few ULPs below the other. When that happened, the chosen
+  window silently got TRUNCATED to the spurious split's block A duration
+  instead of the full required window - a real, if rare, mis-sized
+  charging window, not just a flat-block-extension quirk. Fixed with a
+  1e-6 margin on the split-vs-single-block cost comparison (far below any
+  price difference that could ever be a genuine saving). Found via this
+  project's own regression scripts while verifying the change above -
+  several of them use flat background prices and had been silently
+  hitting this since 2026.10.11 without anyone noticing, because the
+  pre-2026.10.13 code simply skipped flat-block extension outright
+  whenever `is_split_chosen` was true, which happened to mask the
+  truncation's main visible symptom.
+- **`split_b_average_price` was computed but never actually exposed** as
+  a sensor attribute (2026.10.11) - only read internally via the local
+  Python variable, so it never reached the dashboard or `extra_state_attributes`
+  at all.
+
+## [2026.10.13] - 2026-10-23
+
+### Fixed
+- **Flat-block extension (2026.10.11 split-session work) no longer skips the
+  backward direction when a split is chosen.** Spotted by looking at a real
+  dashboard render: a flat/cheap price stretch sitting right before block
+  A's own start wasn't being ridden into, even though nothing about it was
+  risky. The original 2026.10.11 scoping turned the whole extension off for
+  a chosen split, reasoning that extending could eat into the
+  deliberately-priced-out gap before block B - true for the *forward*
+  direction (extending past block A's own end, toward the gap/peak), but
+  the *backward* direction (extending earlier, before block A's start)
+  never touches that gap at all. Forward extension stays off for a split;
+  backward extension now keeps its full headroom budget, exactly as it
+  already does for a normal (non-split) plan. Verified with a dedicated
+  regression case (a flat-priced stretch placed immediately before a
+  chosen split's block A) confirming `charge_window_backward_extension_units
+  > 0` while `charge_window_forward_extension_units` stays `0`, plus a
+  re-run of the existing split/non-split simulations showing no change
+  in their outcomes.
+- **`houseboat-price-card`: block A's and block B's "Laden gepland <time>"
+  labels could overlap/run into each other** on a split plan when the two
+  charge windows land close together on the time axis relative to the
+  card's width (common on a narrow/mobile dashboard). Block B's label now
+  sits on its own row, 12px below block A's, whenever a split is in play
+  (reserving a taller label area up front instead of trying to measure
+  rendered text width at render time), so the two never collide regardless
+  of card width or how close the two blocks are.
+
+## [2026.10.12] - 2026-10-23
+
+### Added
+- **The dashboard cards now show block B of a split-session plan**
+  (2026.10.11), instead of only ever showing block A and leaving the split
+  itself invisible on the dashboard:
+  - `houseboat-price-card`: draws a second highlighted bar and "Laden
+    gepland <time>" label for block B's own reserved slot, alongside
+    block A's - the same three-tier fallback as block A (locked session
+    plan -> locked pending plan -> live search preview), just reading
+    `charge_plan_b_*`/`pending_plan_b_*`/`split_b_start_index` +
+    `split_b_duration_units` instead.
+  - `houseboat-status-card`: the CHARGE tile gets a slim extra line
+    ("dan <start>–<stop>") under block A's own progress bar whenever a
+    block B is pending - no second progress bar (block B isn't running
+    yet, so there'd be nothing live to show), just enough to make the
+    pause-and-resume visible without cluttering the tile.
+  - A normal, non-split plan is entirely unaffected: `splitBWindow()`
+    returns null and neither card renders anything extra.
+
 ## [2026.10.11] - 2026-10-23
 
 ### Added

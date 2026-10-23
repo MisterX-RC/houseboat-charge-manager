@@ -47,6 +47,7 @@ const I18N = {
     left: (d) => `${d} left`, done: "done", stop: "stop", h: "h", min: "min", ago: (h) => `-${h} h`,
     status_title: "Charge", departure: "Departure",
     auto_control: "Automatic control",
+    split_then: "then",
   },
   nl: {
     now: "nu", per_kwh: "/kWh", cheapest: "goedkoopst", most_expensive: "duurst",
@@ -55,6 +56,7 @@ const I18N = {
     left: (d) => `nog ${d}`, done: "klaar", stop: "stop", h: "u", min: "min", ago: (h) => `-${h} u`,
     status_title: "Charge", departure: "Vertrek",
     auto_control: "Automatische aansturing",
+    split_then: "dan",
   },
 };
 function hassLang(hass) {
@@ -208,6 +210,36 @@ function chargeWindow(attrs) {
   return { startUnit, durationUnits, favorable, targetSoc, isIdle, priceLimit, windowPrice };
 }
 
+// Block B of a split-session plan (2026.10.11, logic.py) - same three-tier
+// fallback as chargeWindow above (locked session plan while block A is
+// charging/paused -> locked pending plan once latched -> the live search
+// preview), just for the reserved second block. Unlike block A's start_unit,
+// the live preview's split_b_start_index is INTERVAL-relative (same frame
+// the sensor itself uses before adding interval_start_unit - see
+// pending_plan_b_start_unit in logic.py), so it needs that offset added here
+// too. Returns null whenever no split is in play (the normal, single-block
+// case - unaffected).
+function splitBWindow(attrs) {
+  if (attrs.charge_plan_b_start_unit != null) {
+    return { startUnit: Number(attrs.charge_plan_b_start_unit), durationUnits: Number(attrs.charge_plan_b_duration_units) || 0 };
+  }
+  if (attrs.pending_plan_b_start_unit != null) {
+    return { startUnit: Number(attrs.pending_plan_b_start_unit), durationUnits: Number(attrs.pending_plan_b_duration_units) || 0 };
+  }
+  // Live-preview tier (nothing locked/pending yet): prefer block B's own
+  // EXTENDED window (2026.10.13 - folds in whatever flat-block extension
+  // block B itself earned), falling back to its raw search position for
+  // older sensor data that doesn't expose the *_effective_*/*_planned_*
+  // pair yet.
+  if (attrs.is_split_chosen && attrs.split_b_effective_start_index != null && attrs.split_b_planned_duration_units != null) {
+    return { startUnit: (Number(attrs.interval_start_unit) || 0) + Number(attrs.split_b_effective_start_index), durationUnits: Number(attrs.split_b_planned_duration_units) || 0 };
+  }
+  if (attrs.is_split_chosen && attrs.split_b_start_index != null && attrs.split_b_duration_units != null) {
+    return { startUnit: (Number(attrs.interval_start_unit) || 0) + Number(attrs.split_b_start_index), durationUnits: Number(attrs.split_b_duration_units) || 0 };
+  }
+  return null;
+}
+
 const BASE_CSS = `
   :host { display: block; }
   ha-card { padding: 16px; display: flex; flex-direction: column; gap: 14px; overflow: hidden; container-type: inline-size; }
@@ -350,8 +382,17 @@ class HouseboatPriceCard extends HTMLElement {
     const win = chargeWindow(attrs);
     const hasWindow = !win.isIdle;
     const windowColor = win.favorable ? opt.buy_color : "#ff5252";
+    // Needed up here (before `top` is sized) so a second reserved label
+    // row can be budgeted for whenever a split is in play - computing it
+    // only has to know `attrs`/`hasWindow`, not any of the layout below.
+    const winB = hasWindow ? splitBWindow(attrs) : null;
     const X0 = 34;
-    const top = hasWindow ? 18 : 8;
+    // A split's two labels are staggered onto their own row (block B 12px
+    // below block A - see drawWindow) rather than collision-checked by
+    // pixel position, since that stays correct at any card width without
+    // having to estimate rendered text width: reserve the extra row's
+    // height outright whenever block B exists.
+    const top = hasWindow ? (winB ? 30 : 18) : 8;
     const H = Math.max(clamp(Number(opt.height) || 170, 100, 600) - 18, 60);
     const bottom = top + H;
     const valid = prices.filter((v) => v !== null);
@@ -400,21 +441,36 @@ class HouseboatPriceCard extends HTMLElement {
       .map((i) => `M${r1(xi(i))} ${r1(base)}V${r1(y(prices[i]))}H${r1(xi(i) + bw - gap)}V${r1(base)}Z`)
       .join("");
 
-    const winStartMs = T0 + win.startUnit * unitMs;
-    const winStopMs = T0 + (win.startUnit + win.durationUnits) * unitMs;
-    const inWindow = (i) => hasWindow && T0 + i * unitMs + unitMs > winStartMs && T0 + i * unitMs < winStopMs;
+    // Draws one charge-window highlight (the shaded band, its bottom
+    // streak, and its "Charge planned <time>" label) - called once for
+    // block A (always) and, when the plan is a chosen split (2026.10.11),
+    // a second time for block B's own reserved slot, so a split shows as
+    // two separate bars on the chart instead of silently collapsing to
+    // just block A.
+    const drawWindow = (startUnit, durationUnits, labelTop) => {
+      const startMs = T0 + startUnit * unitMs;
+      const stopMs = T0 + (startUnit + durationUnits) * unitMs;
+      const inRange = (i) => T0 + i * unitMs + unitMs > startMs && T0 + i * unitMs < stopMs;
+      if (!(stopMs > startMs && stopMs > T0 && startMs < T1)) return { under: "", streak: "", label: "", inRange: () => false };
+      const x0 = x(Math.max(startMs, T0));
+      const x1 = x(Math.min(stopMs, T1));
+      const under = `<rect x="${r1(x0 - 1)}" y="${top - 4}" width="${r1(Math.max(x1 - x0 + 2, 2))}" height="${r1(H + 4)}" rx="3" fill="${windowColor}" fill-opacity="0.22" stroke="${windowColor}" stroke-opacity="0.55" stroke-width="1"/>`;
+      const streak = `<rect x="${r1(x0 - 1)}" y="${r1(bottom + 3)}" width="${r1(Math.max(x1 - x0 + 2, 2))}" height="3" rx="1.5" fill="${windowColor}"/>`;
+      const text = `${esc(this._t("legend_charge"))} ${f.time(startMs)}`;
+      const label = `<span class="plabel" style="left:${r1(clamp((x0 + x1) / 2, X0 + 30, W - 30))}px;top:${labelTop}px;color:${tint(windowColor, 1)}">${text}</span>`;
+      return { under, streak, label, inRange };
+    };
+    const blockA = hasWindow ? drawWindow(win.startUnit, win.durationUnits, 0) : { under: "", streak: "", label: "", inRange: () => false };
+    // Block B's label sits on its own row (12px below block A's) whenever
+    // a split is in play, so the two never overlap regardless of how
+    // close block A and block B land on the time axis at this card's
+    // width - see the `top`/winB sizing comment above.
+    const blockB = winB ? drawWindow(winB.startUnit, winB.durationUnits, 12) : { under: "", streak: "", label: "", inRange: () => false };
+    const inWindow = (i) => blockA.inRange(i) || blockB.inRange(i);
     const all = [...Array(n).keys()];
-    let under = "";
-    let streaks = "";
-    let labels = "";
-    if (hasWindow && winStopMs > winStartMs && winStopMs > T0 && winStartMs < T1) {
-      const x0 = x(Math.max(winStartMs, T0));
-      const x1 = x(Math.min(winStopMs, T1));
-      under = `<rect x="${r1(x0 - 1)}" y="${top - 4}" width="${r1(Math.max(x1 - x0 + 2, 2))}" height="${r1(H + 4)}" rx="3" fill="${windowColor}" fill-opacity="0.22" stroke="${windowColor}" stroke-opacity="0.55" stroke-width="1"/>`;
-      streaks = `<rect x="${r1(x0 - 1)}" y="${r1(bottom + 3)}" width="${r1(Math.max(x1 - x0 + 2, 2))}" height="3" rx="1.5" fill="${windowColor}"/>`;
-      const text = `${esc(this._t("legend_charge"))} ${f.time(winStartMs)}`;
-      labels = `<span class="plabel" style="left:${r1(clamp((x0 + x1) / 2, X0 + 30, W - 30))}px;top:0;color:${tint(windowColor, 1)}">${text}</span>`;
-    }
+    const under = blockA.under + blockB.under;
+    const streaks = blockA.streak + blockB.streak;
+    let labels = blockA.label + blockB.label;
     const bg = "var(--ha-card-background, var(--card-background-color, #1c1e24))";
     // Tomorrow's prices usually aren't published until mid-afternoon - the
     // chart still reserves the full 48h (see TWO_DAY_UNITS above), so mark
@@ -669,10 +725,23 @@ class HouseboatStatusCard extends HTMLElement {
     }
     const fill = isCharging ? clamp(((now - startMs) / (stopMs - startMs)) * 100, 0, 100) : 0;
     const soc = win.targetSoc;
+    // Block B of a chosen split (2026.10.11) - shown as a slim extra line
+    // rather than a second full block/progress bar: it isn't running yet
+    // (block A is, or the pause is), so a bar would have nothing live to
+    // show, but leaving it out entirely would make the split invisible
+    // here - the price chart is where both blocks get their own bar.
+    const winB = splitBWindow(attrs);
+    let splitRow = "";
+    if (winB && winB.durationUnits > 0) {
+      const startBMs = T0 + winB.startUnit * UNIT_MS;
+      const stopBMs = T0 + (winB.startUnit + winB.durationUnits) * UNIT_MS;
+      splitRow = `<div class="below split"><span>${esc(this._t("split_then"))} ${esc(f.time(startBMs))}–${esc(f.time(stopBMs))}</span></div>`;
+    }
     return `<div class="block" style="border-color:${isCharging ? color : "transparent"}">${head}
       <div class="times"><span>${esc(f.time(startMs))}</span><span>${esc(f.time(stopMs))}</span></div>
       <div class="bar" style="background:${tint(color, 0.22)}"><div class="fill" style="width:${fill.toFixed(1)}%;background:${color}"></div><div class="bartext">${inBar}</div></div>
       <div class="below"><span>${below}</span><span>${esc(this._t("stop"))}</span></div>
+      ${splitRow}
       <div class="stat">${icon("bolt", color, 16)}<b>${this._num(energy, 1)}</b><span class="dim">kWh</span><span class="dim arrow">→</span>${
         soc == null ? "" : `<b>${this._num(soc, 0)} %</b>`
       }</div>
