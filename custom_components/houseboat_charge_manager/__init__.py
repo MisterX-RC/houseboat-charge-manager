@@ -72,7 +72,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # otherwise ignore any already-saved options on a reload).
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    await coordinator.async_config_entry_first_refresh()
+    try:
+        await coordinator.async_config_entry_first_refresh()
+    except Exception:
+        # The platforms above are already registered for this entry. If a
+        # bad first refresh (e.g. a sensor still unavailable right after
+        # boot, or an exception inside logic.compute()) is left to propagate
+        # as-is - typically as ConfigEntryNotReady, which Home Assistant
+        # retries automatically - the retry's own call to
+        # async_forward_entry_setups blows up with "has already been setup!"
+        # for number/sensor/switch, since they were never unloaded. That
+        # turns one transient failure into a permanently broken entry rather
+        # than a clean retry (2026-10, Timo hit this after updating: the
+        # integration got stuck re-raising "already been setup" instead of
+        # retrying and surfacing the actual underlying error). Undo the
+        # forward here so a retry starts clean, same as async_unload_entry.
+        await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+        hass.data[DOMAIN].pop(entry.entry_id, None)
+        raise
 
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
 

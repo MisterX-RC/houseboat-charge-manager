@@ -13,6 +13,82 @@ Versions are **year.month.release**, like ESS Manager's own (as of
 the releases in that month from 0 - `2026.10.0`, `2026.10.1`, ...,
 `2026.11.0`.
 
+## [2026.10.22] - 2026-10-24
+
+### Fixed
+- **Version bump only, no code change from 2026.10.21** - `v2026.10.19`,
+  `v2026.10.20` and `v2026.10.21` all exist as real GitHub Releases, but all
+  three ended up tagging the *same* commit as `v2026.10.18`: a silent
+  `git commit` failure in `houseboat-charge-manager-sync-and-push.command`
+  (now fixed, see its own history) meant the repo's actual pushed content
+  never advanced past `.18` while the release step - which reads the
+  version straight from the on-disk manifest.json, not from git - kept
+  cutting new, correctly-numbered releases on top of that stale commit.
+  HACS has no way to know those three release tags don't actually contain
+  what their version number promises, and won't re-offer an "update" to a
+  tag it's already seen - so this just mints a fresh, never-before-seen
+  version number to get a release that's actually backed by the real
+  `.21` content (the status-card timeline color fix + the stuck-setup-retry
+  fix) onto GitHub where HACS will offer it.
+
+## [2026.10.21] - 2026-10-24
+
+### Fixed
+- **A failed first refresh could leave the integration permanently stuck
+  instead of retrying cleanly.** `async_setup_entry` forwards `number`/
+  `sensor`/`switch` setup *before* the coordinator's first refresh (needed
+  so the coordinator can read already-saved tunables from `number.py` on a
+  reload), but didn't undo that if the first refresh then failed - e.g. a
+  sensor still unavailable right after boot, or an exception inside
+  `logic.compute()`. That failure normally becomes `ConfigEntryNotReady`,
+  which Home Assistant retries automatically, but with the platforms left
+  registered, the retry's own `async_forward_entry_setups` call immediately
+  errored with `ValueError: ... has already been setup!` for all three
+  platforms - replacing the real, retryable error with a permanent one
+  (Timo hit this after updating: logs showed only the "already been setup"
+  errors, with the actual first-refresh failure masked). `async_setup_entry`
+  now unloads the platforms it just forwarded before re-raising, same
+  cleanup `async_unload_entry` already does, so a bad cycle produces a
+  normal retry (and a visible underlying error in the log) instead of a
+  wedged entry.
+
+## [2026.10.20] - 2026-10-24
+
+### Fixed
+- **Status card: the history timeline/status dot had charging (Actief) in
+  red and Cooldown in blue** - backwards from the rest of the dashboard,
+  where blue (`buy_color`) consistently means "charging" (the CHARGE
+  tile, the price chart's planned/historical blue blocks). That swap was
+  made in an earlier 2026-10 change specifically to match the red the
+  CHARGE block/price chart use for an *unfavorable/forced* charge, but in
+  practice it just made the timeline contradict the dashboard's own color
+  language once seen side-by-side (Timo: "staan rood en blauw andersom?").
+  Actief now uses the card's own `buy_color` (blue, same as everywhere
+  else charging is shown); Cooldown gets its own muted amber instead of
+  blue, so it stays visually distinct from both charging and plain idle;
+  "100% mode" (forced/non-price-driven charging, e.g. a calibration
+  cycle) keeps the vivid red, now correctly read as the one state that's
+  actually non-favorable rather than as "charging" in general.
+
+## [2026.10.19] - 2026-10-24
+
+### Added
+- **Price card: SoC line, now backed by real history before "now".**
+  Shown as a preview first (purely a forward projection from the live
+  SoC), then extended once it became clear a separate Victron SoC
+  sensor with recorder history is actually available: the already-
+  elapsed part of today is now the REAL measured SoC (solid line),
+  joined at "now" to the same forward-looking projection as before
+  (drain to the planned window, rise through it, drain again - see
+  2026-10's own comment in the card), now drawn dashed to mark it as an
+  estimate rather than a measurement, matching the price-limit line's
+  existing dashed convention. New card option `soc_entity`: the
+  recorder-tracked battery SoC sensor's entity_id - without it the card
+  falls back to projection-only (dashed from "now" onward, nothing
+  before it), same as before this entry. `show_soc` (default `true`)
+  turns the whole line off; `soc_color` picks its color. Own 0/50/100%
+  axis on the chart's right edge, own legend entry.
+
 ## [2026.10.18] - 2026-10-24
 
 ### Added

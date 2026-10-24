@@ -29,8 +29,15 @@
  *                          show_history (today's already-finished
  *                          charging sessions, same blue block as the
  *                          planned window - default true),
+ *                          show_soc (SoC line: real history (solid) up
+ *                          to now, projection (dashed) beyond - default
+ *                          true), soc_entity (a separate recorder-
+ *                          tracked battery SoC sensor's entity_id, for
+ *                          the real/solid part - omit to show the
+ *                          projection only),
  *                          cheap_color, mid_color, high_color, buy_color,
- *                          limit_color (all [r,g,b] or "#rrggbb")
+ *                          limit_color, soc_color (all [r,g,b] or
+ *                          "#rrggbb")
  *   houseboat-status-card: title, automation (an entity_id to show as a
  *                          toggle row — omit if you don't have one),
  *                          show_history, hours, buy_color, limit_color
@@ -45,7 +52,7 @@ const _formats = {};
 const I18N = {
   en: {
     now: "now", per_kwh: "/kWh", cheapest: "cheapest", most_expensive: "most expensive",
-    legend_level: "price level", legend_charge: "Charge planned", legend_limit: "Price limit",
+    legend_level: "price level", legend_charge: "Charge planned", legend_limit: "Price limit", legend_soc: "SoC (expected)",
     no_prices: "No prices yet", no_charge: "No charge planned", planned: "planned", running: "running",
     left: (d) => `${d} left`, done: "done", stop: "stop", h: "h", min: "min", ago: (h) => `-${h} h`,
     status_title: "Charge", departure: "Departure",
@@ -54,7 +61,7 @@ const I18N = {
   },
   nl: {
     now: "nu", per_kwh: "/kWh", cheapest: "goedkoopst", most_expensive: "duurst",
-    legend_level: "prijsniveau", legend_charge: "Laden gepland", legend_limit: "Prijslimiet",
+    legend_level: "prijsniveau", legend_charge: "Laden gepland", legend_limit: "Prijslimiet", legend_soc: "SoC (verwacht)",
     no_prices: "Nog geen prijzen", no_charge: "Geen laadactie gepland", planned: "gepland", running: "bezig",
     left: (d) => `nog ${d}`, done: "klaar", stop: "stop", h: "u", min: "min", ago: (h) => `-${h} u`,
     status_title: "Charge", departure: "Vertrek",
@@ -273,11 +280,11 @@ const BASE_CSS = `
 
 // -- Price card ---------------------------------------------------------------------
 const PRICE_DEFAULTS = {
-  title: "", height: 170, show_extremes: true, legend: true, show_history: true,
+  title: "", height: 170, show_extremes: true, legend: true, show_history: true, show_soc: true,
   cheap_color: [63, 174, 106], mid_color: [224, 195, 65], high_color: [240, 112, 60],
-  buy_color: [79, 163, 247], limit_color: [160, 160, 160],
+  buy_color: [79, 163, 247], limit_color: [160, 160, 160], soc_color: [179, 136, 255],
 };
-const PRICE_COLOR_KEYS = ["cheap_color", "mid_color", "high_color", "buy_color", "limit_color"];
+const PRICE_COLOR_KEYS = ["cheap_color", "mid_color", "high_color", "buy_color", "limit_color", "soc_color"];
 
 class HouseboatPriceCard extends HTMLElement {
   static getStubConfig() {
@@ -292,6 +299,8 @@ class HouseboatPriceCard extends HTMLElement {
     this._renderKey = null;
     this._history = null;
     this._historyFor = null;
+    this._socHistory = null;
+    this._socHistoryFor = null;
     if (!this.shadowRoot) this.attachShadow({ mode: "open" });
     this._render();
   }
@@ -301,6 +310,32 @@ class HouseboatPriceCard extends HTMLElement {
   }
   getCardSize() {
     return 4;
+  }
+  // Today's REAL measured SoC so far, from a separate recorder-tracked
+  // battery SoC sensor (config: soc_entity - this integration's own
+  // sensor doesn't keep SoC history itself, only the live reading). Only
+  // used for the already-elapsed part of the projected-SoC line below;
+  // same once-per-day + 5-minute-refresh caching as _loadHistory above.
+  async _loadSocHistory(entityId, T0) {
+    const key = `${entityId}|${T0}`;
+    const now = Date.now();
+    if (this._socHistoryFor === key && this._socHistoryAt && now - this._socHistoryAt < 300000) return;
+    if (this._socHistoryLoading) return;
+    this._socHistoryLoading = true;
+    try {
+      const items = await fetchHistory(this._hass, entityId, T0, now);
+      this._socHistory = items
+        .map(([t, state]) => ({ t, soc: num(state) }))
+        .filter((p) => p.soc !== null);
+    } catch (err) {
+      this._socHistory = [];
+    } finally {
+      this._socHistoryFor = key;
+      this._socHistoryAt = Date.now();
+      this._socHistoryLoading = false;
+      this._renderKey = null;
+      this._render();
+    }
   }
   // Today's already-elapsed charging sessions (state history, same
   // recorder query the status card's timeline uses) - fetched once per
@@ -318,8 +353,9 @@ class HouseboatPriceCard extends HTMLElement {
     try {
       const items = await fetchHistory(this._hass, entityId, T0, now);
       // Only the states the status card's own timeline already treats as
-      // "actually charging" (TIMELINE_COLORS' comment: 100% mode is a
-      // charging state too, just kept visually distinct there) - Standby/
+      // "actually charging" (see timelineColor()/TIMELINE_STATIC_COLORS:
+      // 100% mode is a charging state too, just kept visually distinct
+      // there) - Standby/
       // Wait for start/Start charge/Stop charge/Cooldown are all non-
       // delivering, so they're left out here on purpose.
       const CHARGING_STATES = new Set(["Actief", "100% mode"]);
@@ -394,7 +430,8 @@ class HouseboatPriceCard extends HTMLElement {
     }
     const attrs = stateObj.attributes;
     const width = this._chartWidth();
-    const key = [stateObj, width, hassLang(this._hass), this._history];
+    const socEntity = this._config.soc_entity || null;
+    const key = [stateObj, width, hassLang(this._hass), this._history, this._socHistory, socEntity];
     if (this._renderKey && key.every((v, i) => v === this._renderKey[i])) return;
     this._renderKey = key;
 
@@ -407,6 +444,12 @@ class HouseboatPriceCard extends HTMLElement {
     } else if (opt.show_history !== false && this._historyAt && Date.now() - this._historyAt >= 300000) {
       this._historyAt = 0;
       this._loadHistory(this._config.entity, T0);
+    }
+    if (socEntity && this._socHistoryFor !== `${socEntity}|${T0}` && !this._socHistoryLoading) {
+      this._loadSocHistory(socEntity, T0);
+    } else if (socEntity && this._socHistoryAt && Date.now() - this._socHistoryAt >= 300000) {
+      this._socHistoryAt = 0;
+      this._loadSocHistory(socEntity, T0);
     }
     const title = esc(opt.title || this._t("status_title"));
     const prices = (attrs.all_price || []).map(num);
@@ -563,11 +606,84 @@ class HouseboatPriceCard extends HTMLElement {
     } else if (limitVal !== null) {
       limitLine = `<line x1="${X0}" y1="${r1(y(limitVal))}" x2="${W}" y2="${r1(y(limitVal))}" style="stroke:${opt.limit_color}" stroke-width="1.5" stroke-dasharray="4 3"/>`;
     }
+    // SoC line (2026-10): REAL measured history up to now (solid - from
+    // a separate recorder-tracked battery SoC sensor, config: soc_entity;
+    // this integration's own sensor only has a live soc reading, not
+    // history, so without soc_entity there's simply nothing to draw
+    // before `now`) joined to a forward PROJECTION of where the battery
+    // is headed given the current plan (dashed, same convention as the
+    // price-limit line above - it's an estimate, not a measurement).
+    // Projection waypoints: now (live soc) -> drain down to
+    // soc_at_window_start (same figure/formula the sensor itself already
+    // exposes) -> rise through the charge window(s) to projected_end_soc,
+    // flat through a split's pause -> drain again from there for the
+    // rest of the chart. A chosen split's rise is shared between block A
+    // and block B by DURATION (not real energy - the sensor doesn't
+    // expose each block's own kWh separately), a fair approximation
+    // since the charge rate is roughly constant throughout.
+    const ySoc = (v) => top + ((100 - clamp(v, 0, 100)) / 100) * H;
+    let socPastLine = "";
+    let socFutureLine = "";
+    let socAxis = "";
+    const showSoc = opt.show_soc !== false && socNow !== null;
+    if (showSoc) {
+      const floorForDrain = floorSoc !== null ? floorSoc : 0;
+      const pathFrom = (pts) => pts
+        .map((p, idx) => `${idx === 0 ? "M" : "L"}${r1(xi(clamp(p.i, 0, n)) + bw / 2)} ${r1(ySoc(p.soc))}`)
+        .join("");
+
+      // Real history, today only (anything at/after `now` is left to the
+      // projection below) - drawn up to and including the live reading,
+      // so the solid line always ends exactly on "now" rather than
+      // stopping a few minutes early at the recorder's last sample.
+      const histPts = (this._socHistory || [])
+        .filter((p) => p.t >= T0 && p.t <= now)
+        .map((p) => ({ i: (p.t - T0) / unitMs, soc: p.soc }));
+      if (histPts.length) {
+        histPts.push({ i: cur, soc: socNow });
+        socPastLine = `<path d="${pathFrom(histPts)}" fill="none" style="stroke:${opt.soc_color}" stroke-width="1.8"/>`;
+      }
+
+      const pts = [{ i: cur, soc: socNow }];
+      // Window start/end clamped to >= now: once charging has actually
+      // started, win.startUnit (charge_plan_start_unit) can already sit
+      // in the past - there's no drain leg to draw in that case, the
+      // curve should pick straight up from socNow into the rise.
+      if (hasWindow) {
+        const aStart = Math.max(win.startUnit, cur);
+        const aEnd = Math.max(win.startUnit + win.durationUnits, aStart);
+        const atStart = num(attrs.soc_at_window_start);
+        const startSoc = aStart > cur
+          ? (atStart !== null ? atStart : Math.max(socNow - drainPerUnit * (aStart - cur), floorForDrain))
+          : socNow;
+        pts.push({ i: aStart, soc: startSoc });
+        const endSoc = num(attrs.projected_end_soc);
+        if (winB && winB.durationUnits > 0) {
+          const bStart = Math.max(winB.startUnit, aEnd);
+          const bEnd = Math.max(winB.startUnit + winB.durationUnits, bStart);
+          const totalDur = Math.max(win.durationUnits + winB.durationUnits, 1);
+          const totalRise = endSoc !== null ? endSoc - startSoc : 0;
+          const afterA = startSoc + totalRise * (win.durationUnits / totalDur);
+          pts.push({ i: aEnd, soc: afterA });
+          pts.push({ i: bStart, soc: afterA });
+          pts.push({ i: bEnd, soc: endSoc !== null ? endSoc : afterA });
+        } else {
+          pts.push({ i: aEnd, soc: endSoc !== null ? endSoc : startSoc });
+        }
+      }
+      const last = pts[pts.length - 1];
+      if (last.i < n) pts.push({ i: n, soc: Math.max(last.soc - drainPerUnit * (n - last.i), floorForDrain) });
+      socFutureLine = `<path d="${pathFrom(pts)}" fill="none" style="stroke:${opt.soc_color}" stroke-width="1.8" stroke-dasharray="5 3"/>`;
+      socAxis = [0, 50, 100].map((v) =>
+        `<text x="${W}" y="${r1(ySoc(v) + 3)}" text-anchor="end" fill="${opt.soc_color}" fill-opacity="0.8">${v}%</text>`
+      ).join("");
+    }
+    const socLine = socPastLine + socFutureLine;
     const dayLine = n * unitMs > 26 * HOUR_MS ? nextMidnight(this._hass, T0) : null;
     const svg = `<defs>${grad}</defs>${axis}${under}
       <path d="${bars(all)}" fill="url(#lvl)" fill-opacity="0.9"/>
       <path d="${bars(all.filter(inWindow))}" fill="url(#lvl)"/>
-      ${streaks}${limitLine}
+      ${streaks}${limitLine}${socLine}${socAxis}
       ${dayLine ? `<line x1="${r1(x(dayLine))}" y1="${top - 4}" x2="${r1(x(dayLine))}" y2="${r1(bottom + 8)}" stroke="rgba(127,127,127,.45)"/>` : ""}
       <line x1="${r1(xNow)}" y1="${top - 4}" x2="${r1(xNow)}" y2="${r1(bottom)}" style="stroke:var(--primary-text-color, #e8e8e8)" stroke-width="1.2"/>
       ${prices[cur] !== null ? `<circle cx="${r1(xNow)}" cy="${r1(y(prices[cur]))}" r="4" style="fill:var(--primary-text-color, #e8e8e8);stroke:${bg}" stroke-width="2"/>` : ""}`;
@@ -606,6 +722,7 @@ class HouseboatPriceCard extends HTMLElement {
       <span><i style="width:36px;background:linear-gradient(90deg, ${opt.cheap_color}, ${opt.mid_color}, ${opt.high_color})"></i>${esc(this._t("legend_level"))}</span>
       <span><i style="background:${tint(opt.buy_color, 0.6)}"></i>${esc(this._t("legend_charge"))}</span>
       ${limitVal !== null ? `<span><i style="width:12px;height:0;border-top:1.5px dashed ${opt.limit_color};border-radius:0"></i>${esc(this._t("legend_limit"))}</span>` : ""}
+      ${showSoc ? `<span><i style="width:12px;height:0;border-top:1.8px solid ${opt.soc_color};border-radius:0"></i>${esc(this._t("legend_soc"))}</span>` : ""}
     </div>`;
 
     this.shadowRoot.innerHTML = `<style>${BASE_CSS}</style>
@@ -666,19 +783,31 @@ const STATUS_DEFAULTS = {
   buy_color: [79, 163, 247], limit_color: [160, 160, 160],
 };
 const STATUS_COLOR_KEYS = ["buy_color", "limit_color"];
-const TIMELINE_COLORS = {
+const TIMELINE_STATIC_COLORS = {
   // "Wait for start" / "Start charge" / "Stop charge" deliberately share the
   // Standby color (2026-10) - Timo didn't want those as visually distinct
   // segments in the history timeline/status dot, just folded into Standby.
   Standby: "#3b3b3b", "Wait for start": "#3b3b3b", "Start charge": "#3b3b3b", "Stop charge": "#3b3b3b",
-  // Actief/Cooldown swapped (2026-10) so charging reads as red here too,
-  // matching the red the CHARGE block/price chart already use for an
-  // unfavorable/forced charge (see `"#ff5252"` below and at the
-  // `_chargeBlock`/`windowColor` definitions) - "100% mode" gets that same
-  // vivid red (brighter than Actief's muted one) since it's a charging
-  // state as well, just needs to stay visually distinct from plain Actief.
-  Actief: "#9c3a2a", Cooldown: "#24527f", "100% mode": "#ff5252",
+  // Cooldown (post-charge reconnect lock-out, not drawing power) gets its
+  // own muted amber - distinct from both "charging" and plain idle.
+  Cooldown: "#8a6239",
+  // Forced/non-price-driven charging (e.g. a calibration cycle ignoring
+  // the price limit) stays the same red the CHARGE block/price chart
+  // already use for an unfavorable/forced charge window - see `"#ff5252"`
+  // at the `_chargeBlock`/`windowColor` definitions.
+  "100% mode": "#ff5252",
 };
+// Actief (actually charging, the normal/favorable case) uses the card's
+// own configurable buy_color, same blue the CHARGE tile and the price
+// chart's planned-window blocks already use for "charging" - an earlier
+// version (2026-10) swapped this to red "to read as charging" against
+// those same blue blocks, which in hindsight just made the timeline
+// contradict the rest of the dashboard's own color language (Timo: red
+// and blue looked backwards once he saw it next to the blue CHARGE tile).
+function timelineColor(state, opt) {
+  if (state === "Actief") return opt.buy_color;
+  return TIMELINE_STATIC_COLORS[state] || null;
+}
 
 class HouseboatStatusCard extends HTMLElement {
   static getStubConfig() {
@@ -881,7 +1010,7 @@ class HouseboatStatusCard extends HTMLElement {
             // covers, e.g. "Cooldown · 14:05–14:20" (2026-10, Timo asked for
             // a hover-to-see-status on the timeline strip).
             const tip = seg.from != null && seg.to != null ? `${seg.state} · ${f.time(seg.from)}–${f.time(seg.to)}` : seg.state;
-            return `<span title="${esc(tip)}" style="flex:${seg.seconds} 0 0;background:${TIMELINE_COLORS[seg.state] || "#2a2a2a"}"></span>`;
+            return `<span title="${esc(tip)}" style="flex:${seg.seconds} 0 0;background:${timelineColor(seg.state, opt) || "#2a2a2a"}"></span>`;
           }).join("")
         : `<span style="flex:1 0 0;background:#2a2a2a"></span>`;
       const hours = opt.hours;
@@ -927,7 +1056,7 @@ class HouseboatStatusCard extends HTMLElement {
       .axis { display: flex; justify-content: space-between; font-size: 11px; color: var(--secondary-text-color, #a0a0a0); margin-top: -8px; }
     </style>
     <ha-card>
-      <div class="top"><span class="title">${esc(opt.title)}</span><span class="status"><i style="background:${TIMELINE_COLORS[stateObj.state] || "#8a8a8a"}"></i>${esc(stateObj.state)}</span></div>
+      <div class="top"><span class="title">${esc(opt.title)}</span><span class="status"><i style="background:${timelineColor(stateObj.state, opt) || "#8a8a8a"}"></i>${esc(stateObj.state)}</span></div>
       <div class="layout">
         ${this._chargeBlock(attrs, opt)}
         <div class="side-col">${this._limitTile(attrs, opt)}${voyage}</div>
