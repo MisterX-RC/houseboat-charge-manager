@@ -13,6 +13,101 @@ Versions are **year.month.release**, like ESS Manager's own (as of
 the releases in that month from 0 - `2026.10.0`, `2026.10.1`, ...,
 `2026.11.0`.
 
+## [2026.10.17] - 2026-10-24
+
+### Changed
+- **The look-ahead SoC projection from 2026.10.16 is no longer only shown
+  on the dashboard - it now actually feeds the plan.** Until now, the
+  window search/price-trim/split-search/flat-block-extension pipeline
+  always sized itself from the LIVE charge_kwh/charge_time_units, even
+  when the window it landed on sat far enough in the future that the
+  battery would genuinely have drained to a lower SoC - and therefore
+  had a bigger real energy gap to the target - by the time it actually
+  started. That meant a long, flat/cheap stretch far ahead could get
+  under-planned: the search would size for today's smaller gap, and the
+  state machine's voltage-reached bypass would only discover the extra
+  real need live, once charging, potentially running on past the cheap
+  stretch into a pricier period. Now, after the search finds a
+  candidate window, the projected SoC at that window's own start
+  (`soc_at_window_start`'s own drain formula, unchanged) is used to
+  recompute the energy need, and if that is meaningfully bigger than
+  the live figure, the ENTIRE search/price-trim/split/extension
+  pipeline is re-run with the bigger need - which can land on a
+  longer, or even differently-placed, window, not merely a longer
+  bolt-on extension of the same spot. Bounded to a handful of passes
+  (self-limiting in every scenario tried - a pass only grows the need
+  further if the window moved even further out than the previous pass
+  already accounted for). New attributes exposed: `charge_kwh_planned`,
+  `charge_time_units_planned` (what the pipeline actually searched
+  with) and `charge_plan_lookahead_adjusted` (whether a correction
+  happened at all this cycle). `charge_kwh`/`charge_time_units`
+  themselves keep reporting the live, right-now snapshot - unchanged,
+  still what `has_charge_need` and friends key off.
+  `projected_charge_kwh_at_window_start` (2026.10.16) stays as the
+  simple, dashboard-facing "what does the need look like at the
+  window's current start" figure; once a plan is settled it now
+  typically lands very close to `charge_kwh_planned`, acting as a nice
+  cross-check between the two. Scope note, same as 2026.10.16's: this
+  only projects the PRIMARY window (block A) - block B's start in a
+  chosen split is not adjusted this way, since its true projected SoC
+  would need to account for block A's own delivered energy plus drain
+  during the pause, not simple linear drain from "now". Requested via
+  this chat as a direct follow-up to 2026.10.16's informational-only
+  preview, once it became clear the user wanted the bigger future need
+  actually planned for, not just displayed.
+
+## [2026.10.16] - 2026-10-24
+
+### Added
+- **Forward-looking preview of the charge need: `projected_charge_kwh_at_window_start`**
+  (plus its supporting `projected_battery_energy_at_window_start`). Until now
+  the dashboard only showed `charge_kwh`/`battery_energy`, both based on the
+  LIVE SoC right now - accurate for what actually gets planned (nothing
+  locks in until the window is imminent, at which point live SoC and SoC-at-
+  start are practically the same value), but not very informative about what
+  will actually happen if the chosen window sits far in the future and the
+  battery keeps draining in the meantime. The existing `soc_at_window_start`
+  projection (already used internally to feed the dynamic price ceiling) is
+  now also used to compute what the energy gap/`charge_kwh` would look like
+  AT that projected SoC, purely for display. This is informational only - it
+  does **not** feed back into `charge_kwh`, `charge_time_units`, or the
+  window search itself, which deliberately stay on the live SoC for the
+  reason above. Scope note: this currently covers the primary window
+  (block A) only, not block B's start in a split session - block B's true
+  projected SoC would need a different calculation (accounting for the
+  energy block A delivers plus drain during the pause in between, not a
+  simple linear drain from "now"), which isn't implemented yet. Requested
+  via this chat, after noticing a day with a long flat/cheap stretch where
+  it would help to see the expected SoC at the moment of starting, not just
+  right now.
+
+## [2026.10.15] - 2026-10-24
+
+### Changed
+- **A full charge cycle's planned duration (`charge_time_units`) now
+  includes the balance-settle hold time**, not just the existing
+  calibration grid buffer. A calibration/voyage-hold cycle only ever
+  completes once `is_balance_settled` (voltage full + cells balanced,
+  held for `balance_settle_minutes`) - so for exactly this cycle type,
+  that hold is a certainty, not a maybe, the moment the cycle starts.
+  Previously only `calibration_grid_buffer_minutes` was added to the
+  planned duration; `balance_settle_minutes` was left out entirely, so
+  the window search (and, when a split is chosen, the split search) sized
+  itself for too little time. The real session already ran longer when
+  needed - the state machine's voltage-reached bypass (2026.10.11) keeps
+  charging past the planned duration regardless of price until settled -
+  but that only discovers the extra time live, after the planned window
+  (and whatever cheap/flat stretch it sat in) has already passed, so the
+  settle tail could land anywhere, cheap or not. Planning for it up front
+  lets the search place the WHOLE required stretch - settle hold
+  included - inside a cheap/flat period when one is available, instead of
+  only the bulk-charge portion. New attribute `balance_settle_buffer_minutes`
+  exposed alongside the existing `calibration_grid_buffer_minutes`, same
+  gating (`is_full_charge_cycle`). Found and designed via this chat after
+  looking at a live "Wait for start" dump on an unusually flat/cheap day -
+  spotted that the planned window stopped well before the day's cheap
+  stretch actually ended, which was being left entirely to chance.
+
 ## [2026.10.14] - 2026-10-23
 
 ### Changed

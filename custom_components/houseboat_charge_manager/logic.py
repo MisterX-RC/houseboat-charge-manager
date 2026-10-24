@@ -683,7 +683,23 @@ def compute(
     r["charge_time_minutes"] = charge_time_minutes
     calibration_grid_buffer_minutes = T[NUM_CALIBRATION_GRID_BUFFER_MINUTES] if is_full_charge_cycle else 0
     r["calibration_grid_buffer_minutes"] = calibration_grid_buffer_minutes
-    charge_time_units = math.ceil((charge_time_minutes + calibration_grid_buffer_minutes) / 15)
+    # A full charge cycle (calibration or voyage-hold) only ever completes
+    # once is_balance_settled - see BALANCE CONFIRMATION above - so for
+    # exactly this cycle type the settle hold isn't a maybe, it's a
+    # certainty: whenever is_full_charge_cycle is true, the session WILL
+    # need balance_settle_minutes of continued full+balanced holding after
+    # voltage target is reached before it's actually done. Planning for it
+    # up front - same way calibration_grid_buffer_minutes already is -
+    # means the window search sees the TRUE required duration and picks a
+    # placement where that whole stretch, hold included, fits a cheap/flat
+    # period, instead of only discovering live (post duration-elapsed, see
+    # the state machine's voltage-reached bypass) that more time is still
+    # needed and potentially running on into a pricier period by then.
+    balance_settle_buffer_minutes = T[NUM_BALANCE_SETTLE_MINUTES] if is_full_charge_cycle else 0
+    r["balance_settle_buffer_minutes"] = balance_settle_buffer_minutes
+    charge_time_units = math.ceil(
+        (charge_time_minutes + calibration_grid_buffer_minutes + balance_settle_buffer_minutes) / 15
+    )
     r["charge_time_units"] = charge_time_units
     r["charge_time_hours"] = round(charge_time_units / 4, 2)
 
@@ -737,366 +753,463 @@ def compute(
         last_considered_interval_index = min(last_considered_interval_index, low_soc_horizon_units, units_left)
     r["last_considered_interval_index"] = last_considered_interval_index
 
-    duration = max(charge_time_units, 1)
-    horizon = max(last_considered_interval_index, 0)
     soc_floor = float(T[NUM_SOC_FLOOR_PERCENT])
     soc_ceiling = float(T[NUM_SOC_CEILING_PERCENT])
     drain_per_unit = battery_drain_rate_percent_per_hour / 4
 
-    # Both loops require a FULL-length window (len(window) == duration),
-    # not merely a non-empty one: interval_price[idx:idx+duration] silently
-    # truncates near the end of the array instead of raising, so without
-    # this check a 2-unit sliver right at the edge of the horizon was
-    # compared on equal footing against genuine full-duration placements -
-    # and, being an average of only its very cheapest couple of units,
-    # would usually "win" even though it doesn't represent a real
-    # placement for a session that actually needs `duration` units of
-    # charging. That's what previously made a long required session latch
-    # onto a tiny sliver far from any real cheap stretch instead of a
-    # genuinely well-priced placement.
-    best_average, best_index = 1000.0, -1
-    for idx in range(horizon):
-        window = interval_price[idx : idx + duration]
-        if len(window) < duration:
-            continue
-        window_average = _avg(window)
-        if window_average < best_average:
-            best_average, best_index = window_average, idx
-    cheapest_start_index = best_index if best_index >= 0 else 0
-    r["cheapest_start_index"] = cheapest_start_index
+    # -----------------------------------------------------------------
+    # CHEAPEST WINDOW SEARCH / SPLIT-SESSION SEARCH / FLAT-BLOCK EXTENSION
+    # -----------------------------------------------------------------
+    # Wrapped in a function of (plan_charge_kwh, plan_charge_time_units) -
+    # 2026.10.17 - so the whole placement pipeline (search, price-trim,
+    # split search, flat-block extension) can be re-run with a bigger,
+    # look-ahead-adjusted pair instead of only the live snapshot. See the
+    # pass loop right after this function's definition, and
+    # projected_charge_kwh_at_window_start's own comment further down,
+    # for the full reasoning. Safe to call more than once: every r[]
+    # write below is simply overwritten by a later call, and only the
+    # LAST call's return value is ever unpacked into the local variables
+    # the sections after the loop actually use.
+    def _plan_window(plan_charge_kwh: float, plan_charge_time_units: int) -> dict:
+        duration = max(plan_charge_time_units, 1)
+        horizon = max(last_considered_interval_index, 0)
 
-    best_average, best_index = 1000.0, -1
-    for idx in range(horizon):
-        window = interval_price[idx : idx + duration]
-        if len(window) < duration:
-            continue
-        window_average = _avg(window)
-        projected_soc = max(soc - drain_per_unit * idx, soc_floor)
-        projected_ceiling = price_14d_average * max(1 - ((projected_soc - soc_floor) / (soc_ceiling - soc_floor)), 0)
-        if window_average <= projected_ceiling and window_average < best_average:
-            best_average, best_index = window_average, idx
-    price_limited_start_index = best_index
-    r["price_limited_start_index"] = price_limited_start_index
+        # Both loops require a FULL-length window (len(window) == duration),
+        # not merely a non-empty one: interval_price[idx:idx+duration] silently
+        # truncates near the end of the array instead of raising, so without
+        # this check a 2-unit sliver right at the edge of the horizon was
+        # compared on equal footing against genuine full-duration placements -
+        # and, being an average of only its very cheapest couple of units,
+        # would usually "win" even though it doesn't represent a real
+        # placement for a session that actually needs `duration` units of
+        # charging. That's what previously made a long required session latch
+        # onto a tiny sliver far from any real cheap stretch instead of a
+        # genuinely well-priced placement.
+        best_average, best_index = 1000.0, -1
+        for idx in range(horizon):
+            window = interval_price[idx : idx + duration]
+            if len(window) < duration:
+                continue
+            window_average = _avg(window)
+            if window_average < best_average:
+                best_average, best_index = window_average, idx
+        cheapest_start_index = best_index if best_index >= 0 else 0
+        r["cheapest_start_index"] = cheapest_start_index
 
-    anchor = cheapest_start_index
-    full_duration = max(charge_time_units, 1)
-    window = interval_price[anchor : anchor + full_duration]
-    full_average = _avg(window)
-    full_projected_soc = max(soc - drain_per_unit * anchor, soc_floor)
-    full_ceiling = price_14d_average * max(1 - ((full_projected_soc - soc_floor) / (soc_ceiling - soc_floor)), 0)
-    best_len, best_a = 0, 0
-    if window and full_average > full_ceiling and min(window) < full_ceiling:
-        for a in range(full_duration):
-            for b in range(full_duration - a):
-                trial_len = full_duration - a - b
-                if trial_len <= best_len:
-                    continue
-                trial_start = anchor + a
-                trial_window = interval_price[trial_start : trial_start + trial_len]
-                if not trial_window:
-                    continue
-                trial_average = _avg(trial_window)
-                trial_soc = max(soc - drain_per_unit * trial_start, soc_floor)
-                trial_ceiling = price_14d_average * max(1 - ((trial_soc - soc_floor) / (soc_ceiling - soc_floor)), 0)
-                if trial_average <= trial_ceiling:
-                    best_len, best_a = trial_len, a
-    price_trim_start_index = (anchor + best_a) if best_len > 0 else anchor
-    price_trim_duration_units = best_len if best_len > 0 else full_duration
-    r["price_trim_start_index"] = price_trim_start_index
-    r["price_trim_duration_units"] = price_trim_duration_units
+        best_average, best_index = 1000.0, -1
+        for idx in range(horizon):
+            window = interval_price[idx : idx + duration]
+            if len(window) < duration:
+                continue
+            window_average = _avg(window)
+            projected_soc = max(soc - drain_per_unit * idx, soc_floor)
+            projected_ceiling = price_14d_average * max(1 - ((projected_soc - soc_floor) / (soc_ceiling - soc_floor)), 0)
+            if window_average <= projected_ceiling and window_average < best_average:
+                best_average, best_index = window_average, idx
+        price_limited_start_index = best_index
+        r["price_limited_start_index"] = price_limited_start_index
 
-    # Below the SoC floor, the average-price ceiling is no longer
-    # consulted at all - that relaxation exists to patiently trade a
-    # longer wait for a cheaper average price, which is the opposite of
-    # what's wanted here (a short, already tightly-capped session within
-    # a short horizon). Just take the plain cheapest full-duration window
-    # found above.
-    #
-    # When price_limited_start_index >= 0, some position's (SoC-projected)
-    # ceiling was satisfied somewhere in the horizon - i.e. charging at
-    # roughly that price is justified at all. But that candidate was only
-    # ever compared against windows that ALSO passed their own (position-
-    # dependent, generally stricter earlier in the horizon) ceiling - not
-    # against every window outright. cheapest_start_index's average is
-    # always <= price_limited's, by construction (it's the unconditional
-    # minimum over the same full set of full-duration windows), so once
-    # charging is justified at all, the actually-cheapest full-duration
-    # window is also justified - no need to settle for whatever first
-    # cleared its own, possibly-too-strict-for-that-early-position bar.
-    # (Without this, a genuinely cheaper window earlier in the day could
-    # be skipped purely because the SoC-projected ceiling hadn't loosened
-    # enough yet AT THAT position, while a pricier window later - where
-    # the ceiling had since loosened - got used instead.)
-    # ---------------------------------------------------------------
-    # SPLIT-SESSION SEARCH (2026.10.11)
-    # ---------------------------------------------------------------
-    # Only considered in exactly the branch above that would otherwise
-    # charge the FULL required duration as one contiguous block starting
-    # at cheapest_start_index (price_limited_start_index >= 0, i.e.
-    # charging is justified at all) - not below the SoC floor (that mode
-    # deliberately ignores price nuance, by earlier design choice) and not
-    # combined with price-trimming (a different, incompatible shortening
-    # mechanism). "Always split once it's cheaper" (user's explicit
-    # choice) - the only floor is MIN_SPLIT_BLOCK_UNITS per block, plus a
-    # minimum gap of one full cooldown period so block B is never due
-    # before the reconnect lock-out from block A's stop has actually
-    # cleared (also the user's explicit choice, over an unconditional
-    # 1-unit gap).
-    split_min_gap_units = max(math.ceil(float(T[NUM_COOLDOWN_MINUTES]) / UNIT_MINUTES), 1)
-    split_candidate: Optional[tuple[float, int, int, int, int]] = None
-    if not is_below_soc_floor and price_limited_start_index >= 0:
-        split_candidate = _best_two_block_split(
-            interval_price, horizon, duration, MIN_SPLIT_BLOCK_UNITS, split_min_gap_units
-        )
+        anchor = cheapest_start_index
+        full_duration = max(plan_charge_time_units, 1)
+        window = interval_price[anchor : anchor + full_duration]
+        full_average = _avg(window)
+        full_projected_soc = max(soc - drain_per_unit * anchor, soc_floor)
+        full_ceiling = price_14d_average * max(1 - ((full_projected_soc - soc_floor) / (soc_ceiling - soc_floor)), 0)
+        best_len, best_a = 0, 0
+        if window and full_average > full_ceiling and min(window) < full_ceiling:
+            for a in range(full_duration):
+                for b in range(full_duration - a):
+                    trial_len = full_duration - a - b
+                    if trial_len <= best_len:
+                        continue
+                    trial_start = anchor + a
+                    trial_window = interval_price[trial_start : trial_start + trial_len]
+                    if not trial_window:
+                        continue
+                    trial_average = _avg(trial_window)
+                    trial_soc = max(soc - drain_per_unit * trial_start, soc_floor)
+                    trial_ceiling = price_14d_average * max(1 - ((trial_soc - soc_floor) / (soc_ceiling - soc_floor)), 0)
+                    if trial_average <= trial_ceiling:
+                        best_len, best_a = trial_len, a
+        price_trim_start_index = (anchor + best_a) if best_len > 0 else anchor
+        price_trim_duration_units = best_len if best_len > 0 else full_duration
+        r["price_trim_start_index"] = price_trim_start_index
+        r["price_trim_duration_units"] = price_trim_duration_units
 
-    cheapest_window = interval_price[cheapest_start_index : cheapest_start_index + duration]
-    single_block_cost = sum(cheapest_window) if len(cheapest_window) == duration else None
-
-    # The epsilon guards against a split being "chosen" by pure
-    # floating-point noise when the two options are actually tied - e.g.
-    # a uniform/flat background price (easy to hit with a synthetic test
-    # price curve, essentially never with a real day-ahead market) lets
-    # many different placements of the "overflow" duration cost exactly
-    # the same, and summation order alone can then make split_candidate's
-    # sum a few ULPs below single_block_cost. 1e-6 is far below any
-    # price difference that could matter (prices/durations here are never
-    # fine enough for a genuine saving to be that small) while still
-    # comfortably covering float summation error.
-    is_split_chosen = (
-        split_candidate is not None
-        and single_block_cost is not None
-        and split_candidate[0] < single_block_cost - 1e-6
-    )
-    r["is_split_chosen"] = is_split_chosen
-
-    if is_below_soc_floor:
-        start_index = cheapest_start_index
-    elif is_split_chosen:
-        start_index = split_candidate[1]
-    elif price_limited_start_index >= 0:
-        start_index = cheapest_start_index
-    elif price_trim_duration_units < charge_time_units:
-        start_index = price_trim_start_index
-    else:
-        start_index = cheapest_start_index
-    r["start_index"] = start_index
-
-    if is_split_chosen:
-        effective_duration_units = split_candidate[2]
-    else:
-        effective_duration_units = (
-            charge_time_units if (is_below_soc_floor or price_limited_start_index >= 0) else price_trim_duration_units
-        )
-    r["effective_duration_units"] = effective_duration_units
-    r["low_price"] = min(all_price) if all_price else 0.0
-
-    # Block B of a chosen split - interval-relative (same frame as
-    # start_index), consumed by PRE-START LOCK / SESSION LOCK-IN below to
-    # reserve its slot across the pause. None whenever no split is live.
-    if is_split_chosen:
-        split_b_start_index = split_candidate[3]
-        split_b_duration_units = split_candidate[4]
-        split_b_window = interval_price[split_b_start_index : split_b_start_index + split_b_duration_units]
-        split_b_average_price = round(_avg(split_b_window), 4) if split_b_window else 0.0
-    else:
-        split_b_start_index = None
-        split_b_duration_units = None
-        split_b_average_price = None
-    r["split_b_start_index"] = split_b_start_index
-    r["split_b_duration_units"] = split_b_duration_units
-    # Was computed above but never actually exposed before 2026.10.13 -
-    # pending_plan_b_average_price (below) read the local variable
-    # directly, so this gap was invisible downstream, but it meant the
-    # sensor never carried block B's own average price as an attribute.
-    r["split_b_average_price"] = split_b_average_price
-
-    # ---------------------------------------------------------------
-    # FLAT-BLOCK EXTENSION
-    # ---------------------------------------------------------------
-    start = start_index
-    ext_duration = max(effective_duration_units, 1)
-    cwap_window = interval_price[start : start + ext_duration]
-    charge_window_average_price = round(_avg(cwap_window), 4) if cwap_window else 0.0
-    r["charge_window_average_price"] = charge_window_average_price
-
-    flat_block_price_margin = float(T[NUM_FLAT_BLOCK_MARGIN])
-    flat_block_price_tolerance = float(T[NUM_FLAT_BLOCK_TOLERANCE])
-    r["flat_block_price_margin"] = flat_block_price_margin
-    r["flat_block_price_tolerance"] = flat_block_price_tolerance
-
-    def _flat_threshold(avg_price: float) -> float:
-        percentage_threshold = (
-            avg_price * flat_block_price_margin if avg_price >= 0 else avg_price / flat_block_price_margin
-        )
-        absolute_threshold = avg_price + flat_block_price_tolerance
-        return max(percentage_threshold, absolute_threshold)
-
-    flat_block_price_threshold = _flat_threshold(charge_window_average_price)
-    r["flat_block_price_threshold"] = flat_block_price_threshold
-
-    # How much the base (price-ceiling-qualifying, possibly price-trimmed)
-    # window delivers on its own - computed here (and reused below as
-    # effective_charge_kwh) because the extension needs it as its
-    # starting point: "how much is already granted before any flat-block
-    # extension happens". That can be less than charge_kwh itself when
-    # price-trimming shortened the base window below charge_time_units. A
-    # chosen split's two base blocks (l1+l2) always total exactly
-    # charge_time_units (see _best_two_block_split), so together they
-    # deliver exactly charge_kwh, same as an un-trimmed single block -
-    # using only block A's own l1 here would silently drop block B's
-    # share of the already-granted energy and overstate how much headroom
-    # is left for extension.
-    if is_split_chosen:
-        base_charge_kwh = charge_kwh
-    elif effective_duration_units < max(charge_time_units, 1):
-        base_charge_kwh = round(max(effective_duration_units, 1) * (battery_charge_speed / 4) * charger_efficiency, 2)
-    else:
-        base_charge_kwh = charge_kwh
-
-    # The flat-block extension is deliberately allowed to push PAST the
-    # session cap: the whole point of it is that a long flat/uniformly-
-    # cheap stretch is exactly the situation where taking more energy now
-    # - rather than waiting for another day's separately-capped session -
-    # is the efficient thing to do. So headroom is measured against the
-    # full remaining gap to the SoC target, not against charge_kwh (which
-    # is itself session-capped unless is_voyage_charge_forced). The
-    # session cap still fully governs the BASE window(s) chosen by the
-    # search above; it just doesn't also limit how far a genuinely flat
-    # stretch beyond that base window can be ridden.
-    headroom_kwh = max(target_charge_level - battery_energy - base_charge_kwh, 0.0)
-    if battery_charge_speed > 0 and charger_efficiency > 0:
-        max_extra_units = math.floor(headroom_kwh / ((battery_charge_speed / 4) * charger_efficiency))
-    else:
-        max_extra_units = 0
-    max_extra_units = max(max_extra_units, 0)
-
-    def _extend(probe_start: int, step: int, budget: int, threshold: float, limit_idx: Optional[int] = None) -> int:
-        """Walk from `probe_start` in `step` direction (+1/-1), counting
-        consecutive in-bounds units priced at or below `threshold`,
-        stopping at the first disqualifying unit (same "must be
-        contiguous" rule as before 2026.10.13). Capped at `budget` units
-        and at 48 total. `limit_idx`, when given, is the first index (in
-        the direction of travel) that must never be claimed - used to
-        keep a full cooldown gap to the other split block."""
-        extending, extra = True, 0
-        for i in range(48):
-            if not extending or extra >= budget:
-                break
-            idx = probe_start + step * i
-            if idx < 0 or idx >= len(interval_price):
-                break
-            if limit_idx is not None and ((step > 0 and idx >= limit_idx) or (step < 0 and idx <= limit_idx)):
-                break
-            if interval_price[idx] <= threshold:
-                extra += 1
-            else:
-                extending = False
-        return extra
-
-    # split_b_* defaults for the non-split path; overwritten below when a
-    # split is actually chosen.
-    split_b_forward_extension_units: Optional[int] = None
-    split_b_backward_extension_units: Optional[int] = None
-    split_b_extension_units: Optional[int] = None
-    split_b_effective_start_index: Optional[int] = None
-    split_b_planned_duration_units: Optional[int] = None
-
-    if not is_split_chosen:
-        # Single block (unchanged pre-2026.10.13 behaviour): forward gets
-        # first claim on the budget, backward gets whatever's left.
-        forward_units = _extend(start + ext_duration, 1, max_extra_units, flat_block_price_threshold)
-        remaining_budget = max(max_extra_units - forward_units, 0)
-        backward_units = _extend(start - 1, -1, remaining_budget, flat_block_price_threshold)
-        total_extension_units = forward_units + backward_units
-    else:
-        # Chosen split (2026.10.13 refinement): each block is judged on
-        # its own average price/threshold and gets its own two-directional
-        # extension, instead of the whole mechanism being switched off.
-        # The direction AWAY from the other block is as free as a normal
-        # single block's; the direction TOWARD the other block is capped
-        # so at least a full cooldown period (split_min_gap_units) always
-        # remains between them - that gap is the whole reason a split
-        # exists, so neither block may eat into it from either side.
-        # Processed cheapest-block-first (user's explicit choice) so it
-        # gets first claim on the one shared headroom budget; the pricier
-        # block then extends into whatever's left, with its inward limit
-        # based on the cheap block's now-settled (possibly already
-        # extended) boundary rather than its original search position.
-        flat_block_price_threshold_b = _flat_threshold(split_b_average_price)
-        a_is_cheaper = charge_window_average_price <= split_b_average_price
-        remaining_budget = max_extra_units
-
-        if a_is_cheaper:
-            a_back = _extend(start - 1, -1, remaining_budget, flat_block_price_threshold)
-            remaining_budget = max(remaining_budget - a_back, 0)
-            a_fwd_limit = split_b_start_index - split_min_gap_units
-            a_fwd = _extend(start + ext_duration, 1, remaining_budget, flat_block_price_threshold, a_fwd_limit)
-            remaining_budget = max(remaining_budget - a_fwd, 0)
-
-            a_new_end = start + ext_duration + a_fwd
-            b_fwd = _extend(
-                split_b_start_index + split_b_duration_units, 1, remaining_budget, flat_block_price_threshold_b
+        # Below the SoC floor, the average-price ceiling is no longer
+        # consulted at all - that relaxation exists to patiently trade a
+        # longer wait for a cheaper average price, which is the opposite of
+        # what's wanted here (a short, already tightly-capped session within
+        # a short horizon). Just take the plain cheapest full-duration window
+        # found above.
+        #
+        # When price_limited_start_index >= 0, some position's (SoC-projected)
+        # ceiling was satisfied somewhere in the horizon - i.e. charging at
+        # roughly that price is justified at all. But that candidate was only
+        # ever compared against windows that ALSO passed their own (position-
+        # dependent, generally stricter earlier in the horizon) ceiling - not
+        # against every window outright. cheapest_start_index's average is
+        # always <= price_limited's, by construction (it's the unconditional
+        # minimum over the same full set of full-duration windows), so once
+        # charging is justified at all, the actually-cheapest full-duration
+        # window is also justified - no need to settle for whatever first
+        # cleared its own, possibly-too-strict-for-that-early-position bar.
+        # (Without this, a genuinely cheaper window earlier in the day could
+        # be skipped purely because the SoC-projected ceiling hadn't loosened
+        # enough yet AT THAT position, while a pricier window later - where
+        # the ceiling had since loosened - got used instead.)
+        # ---------------------------------------------------------------
+        # SPLIT-SESSION SEARCH (2026.10.11)
+        # ---------------------------------------------------------------
+        # Only considered in exactly the branch above that would otherwise
+        # charge the FULL required duration as one contiguous block starting
+        # at cheapest_start_index (price_limited_start_index >= 0, i.e.
+        # charging is justified at all) - not below the SoC floor (that mode
+        # deliberately ignores price nuance, by earlier design choice) and not
+        # combined with price-trimming (a different, incompatible shortening
+        # mechanism). "Always split once it's cheaper" (user's explicit
+        # choice) - the only floor is MIN_SPLIT_BLOCK_UNITS per block, plus a
+        # minimum gap of one full cooldown period so block B is never due
+        # before the reconnect lock-out from block A's stop has actually
+        # cleared (also the user's explicit choice, over an unconditional
+        # 1-unit gap).
+        split_min_gap_units = max(math.ceil(float(T[NUM_COOLDOWN_MINUTES]) / UNIT_MINUTES), 1)
+        split_candidate: Optional[tuple[float, int, int, int, int]] = None
+        if not is_below_soc_floor and price_limited_start_index >= 0:
+            split_candidate = _best_two_block_split(
+                interval_price, horizon, duration, MIN_SPLIT_BLOCK_UNITS, split_min_gap_units
             )
-            remaining_budget = max(remaining_budget - b_fwd, 0)
-            b_back_limit = a_new_end + split_min_gap_units - 1
-            b_back = _extend(
-                split_b_start_index - 1, -1, remaining_budget, flat_block_price_threshold_b, b_back_limit
-            )
+
+        cheapest_window = interval_price[cheapest_start_index : cheapest_start_index + duration]
+        single_block_cost = sum(cheapest_window) if len(cheapest_window) == duration else None
+
+        # The epsilon guards against a split being "chosen" by pure
+        # floating-point noise when the two options are actually tied - e.g.
+        # a uniform/flat background price (easy to hit with a synthetic test
+        # price curve, essentially never with a real day-ahead market) lets
+        # many different placements of the "overflow" duration cost exactly
+        # the same, and summation order alone can then make split_candidate's
+        # sum a few ULPs below single_block_cost. 1e-6 is far below any
+        # price difference that could matter (prices/durations here are never
+        # fine enough for a genuine saving to be that small) while still
+        # comfortably covering float summation error.
+        is_split_chosen = (
+            split_candidate is not None
+            and single_block_cost is not None
+            and split_candidate[0] < single_block_cost - 1e-6
+        )
+        r["is_split_chosen"] = is_split_chosen
+
+        if is_below_soc_floor:
+            start_index = cheapest_start_index
+        elif is_split_chosen:
+            start_index = split_candidate[1]
+        elif price_limited_start_index >= 0:
+            start_index = cheapest_start_index
+        elif price_trim_duration_units < plan_charge_time_units:
+            start_index = price_trim_start_index
         else:
-            b_fwd = _extend(
-                split_b_start_index + split_b_duration_units, 1, remaining_budget, flat_block_price_threshold_b
+            start_index = cheapest_start_index
+        r["start_index"] = start_index
+
+        if is_split_chosen:
+            effective_duration_units = split_candidate[2]
+        else:
+            effective_duration_units = (
+                plan_charge_time_units if (is_below_soc_floor or price_limited_start_index >= 0) else price_trim_duration_units
             )
-            remaining_budget = max(remaining_budget - b_fwd, 0)
-            b_back_limit = (start + ext_duration) + split_min_gap_units - 1
-            b_back = _extend(
-                split_b_start_index - 1, -1, remaining_budget, flat_block_price_threshold_b, b_back_limit
+        r["effective_duration_units"] = effective_duration_units
+        r["low_price"] = min(all_price) if all_price else 0.0
+
+        # Block B of a chosen split - interval-relative (same frame as
+        # start_index), consumed by PRE-START LOCK / SESSION LOCK-IN below to
+        # reserve its slot across the pause. None whenever no split is live.
+        if is_split_chosen:
+            split_b_start_index = split_candidate[3]
+            split_b_duration_units = split_candidate[4]
+            split_b_window = interval_price[split_b_start_index : split_b_start_index + split_b_duration_units]
+            split_b_average_price = round(_avg(split_b_window), 4) if split_b_window else 0.0
+        else:
+            split_b_start_index = None
+            split_b_duration_units = None
+            split_b_average_price = None
+        r["split_b_start_index"] = split_b_start_index
+        r["split_b_duration_units"] = split_b_duration_units
+        # Was computed above but never actually exposed before 2026.10.13 -
+        # pending_plan_b_average_price (below) read the local variable
+        # directly, so this gap was invisible downstream, but it meant the
+        # sensor never carried block B's own average price as an attribute.
+        r["split_b_average_price"] = split_b_average_price
+
+        # ---------------------------------------------------------------
+        # FLAT-BLOCK EXTENSION
+        # ---------------------------------------------------------------
+        start = start_index
+        ext_duration = max(effective_duration_units, 1)
+        cwap_window = interval_price[start : start + ext_duration]
+        charge_window_average_price = round(_avg(cwap_window), 4) if cwap_window else 0.0
+        r["charge_window_average_price"] = charge_window_average_price
+
+        flat_block_price_margin = float(T[NUM_FLAT_BLOCK_MARGIN])
+        flat_block_price_tolerance = float(T[NUM_FLAT_BLOCK_TOLERANCE])
+        r["flat_block_price_margin"] = flat_block_price_margin
+        r["flat_block_price_tolerance"] = flat_block_price_tolerance
+
+        def _flat_threshold(avg_price: float) -> float:
+            percentage_threshold = (
+                avg_price * flat_block_price_margin if avg_price >= 0 else avg_price / flat_block_price_margin
             )
-            remaining_budget = max(remaining_budget - b_back, 0)
+            absolute_threshold = avg_price + flat_block_price_tolerance
+            return max(percentage_threshold, absolute_threshold)
 
-            b_new_start = split_b_start_index - b_back
-            a_back = _extend(start - 1, -1, remaining_budget, flat_block_price_threshold)
-            remaining_budget = max(remaining_budget - a_back, 0)
-            a_fwd_limit = b_new_start - split_min_gap_units
-            a_fwd = _extend(start + ext_duration, 1, remaining_budget, flat_block_price_threshold, a_fwd_limit)
+        flat_block_price_threshold = _flat_threshold(charge_window_average_price)
+        r["flat_block_price_threshold"] = flat_block_price_threshold
 
-        forward_units, backward_units = a_fwd, a_back
-        split_b_forward_extension_units, split_b_backward_extension_units = b_fwd, b_back
-        split_b_extension_units = b_fwd + b_back
-        split_b_effective_start_index = max(split_b_start_index - b_back, 0)
-        split_b_planned_duration_units = split_b_duration_units + split_b_extension_units
-        total_extension_units = forward_units + backward_units + split_b_extension_units
+        # How much the base (price-ceiling-qualifying, possibly price-trimmed)
+        # window delivers on its own - computed here (and reused below as
+        # effective_charge_kwh) because the extension needs it as its
+        # starting point: "how much is already granted before any flat-block
+        # extension happens". That can be less than plan_charge_kwh itself when
+        # price-trimming shortened the base window below plan_charge_time_units. A
+        # chosen split's two base blocks (l1+l2) always total exactly
+        # plan_charge_time_units (see _best_two_block_split), so together they
+        # deliver exactly plan_charge_kwh, same as an un-trimmed single block -
+        # using only block A's own l1 here would silently drop block B's
+        # share of the already-granted energy and overstate how much headroom
+        # is left for extension.
+        if is_split_chosen:
+            base_charge_kwh = plan_charge_kwh
+        elif effective_duration_units < max(plan_charge_time_units, 1):
+            base_charge_kwh = round(max(effective_duration_units, 1) * (battery_charge_speed / 4) * charger_efficiency, 2)
+        else:
+            base_charge_kwh = plan_charge_kwh
 
-    r["charge_window_forward_extension_units"] = forward_units
-    r["charge_window_backward_extension_units"] = backward_units
-    r["split_b_forward_extension_units"] = split_b_forward_extension_units
-    r["split_b_backward_extension_units"] = split_b_backward_extension_units
-    r["split_b_extension_units"] = split_b_extension_units
-    r["split_b_effective_start_index"] = split_b_effective_start_index
-    r["split_b_planned_duration_units"] = split_b_planned_duration_units
+        # The flat-block extension is deliberately allowed to push PAST the
+        # session cap: the whole point of it is that a long flat/uniformly-
+        # cheap stretch is exactly the situation where taking more energy now
+        # - rather than waiting for another day's separately-capped session -
+        # is the efficient thing to do. So headroom is measured against the
+        # full remaining gap to the SoC target, not against plan_charge_kwh (which
+        # is itself session-capped unless is_voyage_charge_forced). The
+        # session cap still fully governs the BASE window(s) chosen by the
+        # search above; it just doesn't also limit how far a genuinely flat
+        # stretch beyond that base window can be ridden.
+        headroom_kwh = max(target_charge_level - battery_energy - base_charge_kwh, 0.0)
+        if battery_charge_speed > 0 and charger_efficiency > 0:
+            max_extra_units = math.floor(headroom_kwh / ((battery_charge_speed / 4) * charger_efficiency))
+        else:
+            max_extra_units = 0
+        max_extra_units = max(max_extra_units, 0)
 
-    charge_window_extension_units = forward_units + backward_units
-    r["charge_window_extension_units"] = charge_window_extension_units
-    effective_start_index = max(start - backward_units, 0)
-    r["effective_start_index"] = effective_start_index
+        def _extend(probe_start: int, step: int, budget: int, threshold: float, limit_idx: Optional[int] = None) -> int:
+            """Walk from `probe_start` in `step` direction (+1/-1), counting
+            consecutive in-bounds units priced at or below `threshold`,
+            stopping at the first disqualifying unit (same "must be
+            contiguous" rule as before 2026.10.13). Capped at `budget` units
+            and at 48 total. `limit_idx`, when given, is the first index (in
+            the direction of travel) that must never be claimed - used to
+            keep a full cooldown gap to the other split block."""
+            extending, extra = True, 0
+            for i in range(48):
+                if not extending or extra >= budget:
+                    break
+                idx = probe_start + step * i
+                if idx < 0 or idx >= len(interval_price):
+                    break
+                if limit_idx is not None and ((step > 0 and idx >= limit_idx) or (step < 0 and idx <= limit_idx)):
+                    break
+                if interval_price[idx] <= threshold:
+                    extra += 1
+                else:
+                    extending = False
+            return extra
 
-    planned_charge_time_units = effective_duration_units + charge_window_extension_units
-    r["planned_charge_time_units"] = planned_charge_time_units
-    r["planned_charge_time_hours"] = round(planned_charge_time_units / 4, 2)
+        # split_b_* defaults for the non-split path; overwritten below when a
+        # split is actually chosen.
+        split_b_forward_extension_units: Optional[int] = None
+        split_b_backward_extension_units: Optional[int] = None
+        split_b_extension_units: Optional[int] = None
+        split_b_effective_start_index: Optional[int] = None
+        split_b_planned_duration_units: Optional[int] = None
 
-    effective_charge_kwh = base_charge_kwh
-    r["effective_charge_kwh"] = effective_charge_kwh
+        if not is_split_chosen:
+            # Single block (unchanged pre-2026.10.13 behaviour): forward gets
+            # first claim on the budget, backward gets whatever's left.
+            forward_units = _extend(start + ext_duration, 1, max_extra_units, flat_block_price_threshold)
+            remaining_budget = max(max_extra_units - forward_units, 0)
+            backward_units = _extend(start - 1, -1, remaining_budget, flat_block_price_threshold)
+            total_extension_units = forward_units + backward_units
+        else:
+            # Chosen split (2026.10.13 refinement): each block is judged on
+            # its own average price/threshold and gets its own two-directional
+            # extension, instead of the whole mechanism being switched off.
+            # The direction AWAY from the other block is as free as a normal
+            # single block's; the direction TOWARD the other block is capped
+            # so at least a full cooldown period (split_min_gap_units) always
+            # remains between them - that gap is the whole reason a split
+            # exists, so neither block may eat into it from either side.
+            # Processed cheapest-block-first (user's explicit choice) so it
+            # gets first claim on the one shared headroom budget; the pricier
+            # block then extends into whatever's left, with its inward limit
+            # based on the cheap block's now-settled (possibly already
+            # extended) boundary rather than its original search position.
+            flat_block_price_threshold_b = _flat_threshold(split_b_average_price)
+            a_is_cheaper = charge_window_average_price <= split_b_average_price
+            remaining_budget = max_extra_units
 
-    # Total projected energy for the WHOLE plan (both blocks, when split -
-    # this feeds projected_end_soc below, so dropping block B's extension
-    # here would understate the actual projected end-of-session SoC).
-    planned_charge_kwh = round(
-        effective_charge_kwh + (total_extension_units * (battery_charge_speed / 4) * charger_efficiency), 2
-    )
-    r["planned_charge_kwh"] = planned_charge_kwh
-    planned_charge_kwh_gross = (
-        round(planned_charge_kwh / charger_efficiency, 2) if charger_efficiency > 0 else planned_charge_kwh
-    )
-    r["planned_charge_kwh_gross"] = planned_charge_kwh_gross
+            if a_is_cheaper:
+                a_back = _extend(start - 1, -1, remaining_budget, flat_block_price_threshold)
+                remaining_budget = max(remaining_budget - a_back, 0)
+                a_fwd_limit = split_b_start_index - split_min_gap_units
+                a_fwd = _extend(start + ext_duration, 1, remaining_budget, flat_block_price_threshold, a_fwd_limit)
+                remaining_budget = max(remaining_budget - a_fwd, 0)
+
+                a_new_end = start + ext_duration + a_fwd
+                b_fwd = _extend(
+                    split_b_start_index + split_b_duration_units, 1, remaining_budget, flat_block_price_threshold_b
+                )
+                remaining_budget = max(remaining_budget - b_fwd, 0)
+                b_back_limit = a_new_end + split_min_gap_units - 1
+                b_back = _extend(
+                    split_b_start_index - 1, -1, remaining_budget, flat_block_price_threshold_b, b_back_limit
+                )
+            else:
+                b_fwd = _extend(
+                    split_b_start_index + split_b_duration_units, 1, remaining_budget, flat_block_price_threshold_b
+                )
+                remaining_budget = max(remaining_budget - b_fwd, 0)
+                b_back_limit = (start + ext_duration) + split_min_gap_units - 1
+                b_back = _extend(
+                    split_b_start_index - 1, -1, remaining_budget, flat_block_price_threshold_b, b_back_limit
+                )
+                remaining_budget = max(remaining_budget - b_back, 0)
+
+                b_new_start = split_b_start_index - b_back
+                a_back = _extend(start - 1, -1, remaining_budget, flat_block_price_threshold)
+                remaining_budget = max(remaining_budget - a_back, 0)
+                a_fwd_limit = b_new_start - split_min_gap_units
+                a_fwd = _extend(start + ext_duration, 1, remaining_budget, flat_block_price_threshold, a_fwd_limit)
+
+            forward_units, backward_units = a_fwd, a_back
+            split_b_forward_extension_units, split_b_backward_extension_units = b_fwd, b_back
+            split_b_extension_units = b_fwd + b_back
+            split_b_effective_start_index = max(split_b_start_index - b_back, 0)
+            split_b_planned_duration_units = split_b_duration_units + split_b_extension_units
+            total_extension_units = forward_units + backward_units + split_b_extension_units
+
+        r["charge_window_forward_extension_units"] = forward_units
+        r["charge_window_backward_extension_units"] = backward_units
+        r["split_b_forward_extension_units"] = split_b_forward_extension_units
+        r["split_b_backward_extension_units"] = split_b_backward_extension_units
+        r["split_b_extension_units"] = split_b_extension_units
+        r["split_b_effective_start_index"] = split_b_effective_start_index
+        r["split_b_planned_duration_units"] = split_b_planned_duration_units
+
+        charge_window_extension_units = forward_units + backward_units
+        r["charge_window_extension_units"] = charge_window_extension_units
+        effective_start_index = max(start - backward_units, 0)
+        r["effective_start_index"] = effective_start_index
+
+        planned_charge_time_units = effective_duration_units + charge_window_extension_units
+        r["planned_charge_time_units"] = planned_charge_time_units
+        r["planned_charge_time_hours"] = round(planned_charge_time_units / 4, 2)
+
+        effective_charge_kwh = base_charge_kwh
+        r["effective_charge_kwh"] = effective_charge_kwh
+
+        # Total projected energy for the WHOLE plan (both blocks, when split -
+        # this feeds projected_end_soc below, so dropping block B's extension
+        # here would understate the actual projected end-of-session SoC).
+        planned_charge_kwh = round(
+            effective_charge_kwh + (total_extension_units * (battery_charge_speed / 4) * charger_efficiency), 2
+        )
+        r["planned_charge_kwh"] = planned_charge_kwh
+        planned_charge_kwh_gross = (
+            round(planned_charge_kwh / charger_efficiency, 2) if charger_efficiency > 0 else planned_charge_kwh
+        )
+        r["planned_charge_kwh_gross"] = planned_charge_kwh_gross
+        return {
+            "price_limited_start_index": price_limited_start_index,
+            "effective_duration_units": effective_duration_units,
+            "is_split_chosen": is_split_chosen,
+            "split_b_average_price": split_b_average_price,
+            "charge_window_average_price": charge_window_average_price,
+            "split_b_effective_start_index": split_b_effective_start_index,
+            "split_b_planned_duration_units": split_b_planned_duration_units,
+            "charge_window_extension_units": charge_window_extension_units,
+            "effective_start_index": effective_start_index,
+            "planned_charge_time_units": planned_charge_time_units,
+            "planned_charge_kwh": planned_charge_kwh,
+        }
+
+    # -----------------------------------------------------------------
+    # LOOK-AHEAD PASS (2026.10.17)
+    # -----------------------------------------------------------------
+    # Run the plan above with the live charge_kwh/charge_time_units
+    # first, exactly as always. If the window it lands on sits far
+    # enough ahead that the battery will have drained down to a
+    # meaningfully LOWER projected SoC by the time it actually starts,
+    # there is more genuine headroom to the target than today's live
+    # snapshot shows - so re-run the whole placement pipeline with that
+    # bigger, projected need, which can shift the search onto a
+    # longer/different placement (same idea as
+    # projected_charge_kwh_at_window_start below, but now actually fed
+    # back into the plan instead of only shown for information).
+    # Bounded to a few passes as a hard backstop, not because real data
+    # is expected to need more than one correction: each pass only ever
+    # grows plan_charge_kwh/plan_charge_time_units, and growth continues
+    # only if the chosen start moved further out than the previous pass
+    # already accounted for - every scenario tried settles within 1-2
+    # passes. Below the SoC floor or voyage-forced charging effectively
+    # never grow here (is_voyage_charge_forced already ignores the
+    # session cap in the live figure too, and is_below_soc_floor
+    # charging is deliberately short and urgent, not something to plan
+    # further out for) - projected_charge_kwh_candidate comes out equal
+    # to the live figure already in both cases, so the loop below
+    # converges on its very first pass.
+    plan_charge_kwh = charge_kwh
+    plan_charge_time_units = charge_time_units
+    charge_plan_lookahead_adjusted = False
+    plan = _plan_window(plan_charge_kwh, plan_charge_time_units)
+    for _lookahead_pass in range(3):
+        units_ahead_candidate = plan["effective_start_index"]
+        soc_at_candidate_start = max(soc - drain_per_unit * units_ahead_candidate, soc_floor)
+        projected_energy_candidate = round(battery_size * (soc_at_candidate_start / 100), 2)
+        projected_gap_candidate = max(round(target_charge_level - projected_energy_candidate, 1), 0.0)
+        projected_charge_kwh_candidate = (
+            projected_gap_candidate if is_voyage_charge_forced else min(projected_gap_candidate, session_cap_kwh)
+        )
+        if projected_charge_kwh_candidate <= plan_charge_kwh + 0.05:
+            break
+        charge_plan_lookahead_adjusted = True
+        plan_charge_kwh = projected_charge_kwh_candidate
+        lookahead_kwh_gross = (
+            round(plan_charge_kwh / charger_efficiency, 2) if charger_efficiency > 0 else plan_charge_kwh
+        )
+        lookahead_minutes = (
+            round((lookahead_kwh_gross / battery_charge_speed) * 60) if battery_charge_speed > 0 else 0
+        )
+        plan_charge_time_units = math.ceil(
+            (lookahead_minutes + calibration_grid_buffer_minutes + balance_settle_buffer_minutes) / 15
+        )
+        plan = _plan_window(plan_charge_kwh, plan_charge_time_units)
+
+    r["charge_plan_lookahead_adjusted"] = charge_plan_lookahead_adjusted
+    r["charge_kwh_planned"] = plan_charge_kwh
+    r["charge_time_units_planned"] = plan_charge_time_units
+    charge_time_units_used = plan_charge_time_units
+
+    price_limited_start_index = plan["price_limited_start_index"]
+    effective_duration_units = plan["effective_duration_units"]
+    is_split_chosen = plan["is_split_chosen"]
+    split_b_average_price = plan["split_b_average_price"]
+    charge_window_average_price = plan["charge_window_average_price"]
+    split_b_effective_start_index = plan["split_b_effective_start_index"]
+    split_b_planned_duration_units = plan["split_b_planned_duration_units"]
+    charge_window_extension_units = plan["charge_window_extension_units"]
+    effective_start_index = plan["effective_start_index"]
+    planned_charge_time_units = plan["planned_charge_time_units"]
+    planned_charge_kwh = plan["planned_charge_kwh"]
     r["best_interval_price"] = interval_price[effective_start_index : effective_start_index + planned_charge_time_units]
 
     # ---------------------------------------------------------------
@@ -1149,7 +1262,7 @@ def compute(
             now,
         )
         qualifies = (not is_below_soc_floor and price_limited_start_index >= 0) or (
-            effective_duration_units < charge_time_units
+            effective_duration_units < charge_time_units_used
         )
         locked_idx = (int(prev_pending_start) - interval_start_unit) if prev_pending_start is not None else -1
         locked_duration = max(int(pf("pending_plan_duration_units", 0)), 1)
@@ -1383,6 +1496,40 @@ def compute(
         price_14d_average * max(1 - ((soc_at_window_start - soc_floor) / (soc_ceiling - soc_floor)), 0), 4
     )
     r["price_limit_at_window_start"] = price_limit_at_window_start
+
+    # What charge_kwh/gap_kwh looks like using the PROJECTED
+    # soc_at_window_start above instead of the live soc - originally
+    # (2026.10.16) a purely informational preview, but since 2026.10.17
+    # this same projected-need idea IS also what the LOOK-AHEAD PASS
+    # above already fed back into the actual plan (charge_kwh_planned/
+    # charge_time_units_planned, and from there effective_start_index/
+    # planned_charge_time_units/planned_charge_kwh) whenever the chosen
+    # window sits far enough ahead for the drain to matter. So once a
+    # plan is settled this will typically land very close to
+    # charge_kwh_planned (same formula, now evaluated at start_unit -
+    # the actual settled/pending/live start - instead of the lookahead
+    # loop's own last candidate start) - this attribute is kept as the
+    # simple, always-recomputed-fresh "what does the energy need look
+    # like at the window's current start" figure for the dashboard,
+    # while charge_kwh_planned/charge_time_units_planned are the ones
+    # that actually drove the search.
+    # Scope note: this (and the look-ahead pass itself) only projects
+    # the PRIMARY window (block A). Block B's start in a chosen split
+    # is not adjusted this way - its true projected SoC would need a
+    # different calculation (block A's own delivered energy plus drain
+    # during the pause, not simple linear drain from "now"), which
+    # isn't implemented.
+    projected_battery_energy_at_window_start = round(battery_size * (soc_at_window_start / 100), 2)
+    r["projected_battery_energy_at_window_start"] = projected_battery_energy_at_window_start
+    projected_gap_kwh_at_window_start = max(
+        round(target_charge_level - projected_battery_energy_at_window_start, 1), 0.0
+    )
+    projected_charge_kwh_at_window_start = (
+        projected_gap_kwh_at_window_start
+        if is_voyage_charge_forced
+        else min(projected_gap_kwh_at_window_start, session_cap_kwh)
+    )
+    r["projected_charge_kwh_at_window_start"] = projected_charge_kwh_at_window_start
 
     prev_charge_plan_price_limit = P.get("charge_plan_price_limit")
     if is_charging:
