@@ -13,6 +13,26 @@ Versions are **year.month.release**, like ESS Manager's own (as of
 the releases in that month from 0 - `2026.10.0`, `2026.10.1`, ...,
 `2026.11.0`.
 
+## [2026.10.18] - 2026-10-24
+
+### Added
+- **The price card now also shows today's already-finished charging
+  sessions**, as the same shaded blue block (and bottom streak) the
+  planned/live window already uses - not just the upcoming plan. Reads
+  the sensor's own state history (the same recorder query the status
+  card's timeline already uses) for today, keeps only the segments
+  where the state was actually a charging state (`Actief`/`100% mode`),
+  and draws one block per session, without its own time label (to avoid
+  crowding the chart when several short sessions happened). Only
+  today's portion is ever shown, since the chart's left edge is always
+  local midnight - a historical block from before today would be off
+  the left edge of the chart anyway. Re-checks every 5 minutes so a
+  session that starts or stops while the card is open shows up without
+  a reload. New card option `show_history` (default `true`) turns it
+  off. Requested via this chat after shipping the look-ahead planning
+  change, to also see where charging actually already happened today on
+  the same chart.
+
 ## [2026.10.17] - 2026-10-24
 
 ### Changed

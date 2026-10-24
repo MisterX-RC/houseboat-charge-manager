@@ -26,6 +26,9 @@
  *
  * Config (all optional besides entity):
  *   houseboat-price-card:  title, height, show_extremes, legend,
+ *                          show_history (today's already-finished
+ *                          charging sessions, same blue block as the
+ *                          planned window - default true),
  *                          cheap_color, mid_color, high_color, buy_color,
  *                          limit_color (all [r,g,b] or "#rrggbb")
  *   houseboat-status-card: title, automation (an entity_id to show as a
@@ -270,7 +273,7 @@ const BASE_CSS = `
 
 // -- Price card ---------------------------------------------------------------------
 const PRICE_DEFAULTS = {
-  title: "", height: 170, show_extremes: true, legend: true,
+  title: "", height: 170, show_extremes: true, legend: true, show_history: true,
   cheap_color: [63, 174, 106], mid_color: [224, 195, 65], high_color: [240, 112, 60],
   buy_color: [79, 163, 247], limit_color: [160, 160, 160],
 };
@@ -287,6 +290,8 @@ class HouseboatPriceCard extends HTMLElement {
     if (!config || !config.entity) throw new Error("Choose the houseboat charge-manager sensor (entity)");
     this._config = config;
     this._renderKey = null;
+    this._history = null;
+    this._historyFor = null;
     if (!this.shadowRoot) this.attachShadow({ mode: "open" });
     this._render();
   }
@@ -296,6 +301,43 @@ class HouseboatPriceCard extends HTMLElement {
   }
   getCardSize() {
     return 4;
+  }
+  // Today's already-elapsed charging sessions (state history, same
+  // recorder query the status card's timeline uses) - fetched once per
+  // local day (keyed on T0) and re-checked every 5 minutes so a session
+  // that starts/stops while this card is open shows up without a full
+  // page reload. Only today's portion matters: the chart's left edge is
+  // always local midnight (see T0 in _render), so anything from
+  // yesterday or earlier is never on-screen anyway.
+  async _loadHistory(entityId, T0) {
+    const key = `${entityId}|${T0}`;
+    const now = Date.now();
+    if (this._historyFor === key && this._historyAt && now - this._historyAt < 300000) return;
+    if (this._historyLoading) return;
+    this._historyLoading = true;
+    try {
+      const items = await fetchHistory(this._hass, entityId, T0, now);
+      // Only the states the status card's own timeline already treats as
+      // "actually charging" (TIMELINE_COLORS' comment: 100% mode is a
+      // charging state too, just kept visually distinct there) - Standby/
+      // Wait for start/Start charge/Stop charge/Cooldown are all non-
+      // delivering, so they're left out here on purpose.
+      const CHARGING_STATES = new Set(["Actief", "100% mode"]);
+      const segments = [];
+      items.forEach(([from, state], i) => {
+        const to = items[i + 1] ? Math.min(items[i + 1][0], now) : now;
+        if (to > from && CHARGING_STATES.has(state)) segments.push({ from, to });
+      });
+      this._history = segments;
+    } catch (err) {
+      this._history = [];
+    } finally {
+      this._historyFor = key;
+      this._historyAt = Date.now();
+      this._historyLoading = false;
+      this._renderKey = null;
+      this._render();
+    }
   }
   connectedCallback() {
     this._timer = setInterval(() => {
@@ -352,7 +394,7 @@ class HouseboatPriceCard extends HTMLElement {
     }
     const attrs = stateObj.attributes;
     const width = this._chartWidth();
-    const key = [stateObj, width, hassLang(this._hass)];
+    const key = [stateObj, width, hassLang(this._hass), this._history];
     if (this._renderKey && key.every((v, i) => v === this._renderKey[i])) return;
     this._renderKey = key;
 
@@ -360,6 +402,12 @@ class HouseboatPriceCard extends HTMLElement {
     const f = formats(this._hass);
     const now = Date.now();
     const T0 = localMidnight(this._hass, now);
+    if (opt.show_history !== false && this._historyFor !== `${this._config.entity}|${T0}` && !this._historyLoading) {
+      this._loadHistory(this._config.entity, T0);
+    } else if (opt.show_history !== false && this._historyAt && Date.now() - this._historyAt >= 300000) {
+      this._historyAt = 0;
+      this._loadHistory(this._config.entity, T0);
+    }
     const title = esc(opt.title || this._t("status_title"));
     const prices = (attrs.all_price || []).map(num);
     if (!prices.length) {
@@ -447,17 +495,23 @@ class HouseboatPriceCard extends HTMLElement {
     // a second time for block B's own reserved slot, so a split shows as
     // two separate bars on the chart instead of silently collapsing to
     // just block A.
-    const drawWindow = (startUnit, durationUnits, labelTop) => {
+    // `color`/`labelText` default to the live/planned window's own look;
+    // passing a fixed color and `null` for labelText (used for the
+    // already-finished historical blocks below) draws the same shaded
+    // band + bottom streak without a floating time label, since several
+    // of those could otherwise crowd the chart.
+    const drawWindow = (startUnit, durationUnits, labelTop, color, labelText) => {
+      const blockColor = color || windowColor;
       const startMs = T0 + startUnit * unitMs;
       const stopMs = T0 + (startUnit + durationUnits) * unitMs;
       const inRange = (i) => T0 + i * unitMs + unitMs > startMs && T0 + i * unitMs < stopMs;
       if (!(stopMs > startMs && stopMs > T0 && startMs < T1)) return { under: "", streak: "", label: "", inRange: () => false };
       const x0 = x(Math.max(startMs, T0));
       const x1 = x(Math.min(stopMs, T1));
-      const under = `<rect x="${r1(x0 - 1)}" y="${top - 4}" width="${r1(Math.max(x1 - x0 + 2, 2))}" height="${r1(H + 4)}" rx="3" fill="${windowColor}" fill-opacity="0.22" stroke="${windowColor}" stroke-opacity="0.55" stroke-width="1"/>`;
-      const streak = `<rect x="${r1(x0 - 1)}" y="${r1(bottom + 3)}" width="${r1(Math.max(x1 - x0 + 2, 2))}" height="3" rx="1.5" fill="${windowColor}"/>`;
-      const text = `${esc(this._t("legend_charge"))} ${f.time(startMs)}`;
-      const label = `<span class="plabel" style="left:${r1(clamp((x0 + x1) / 2, X0 + 30, W - 30))}px;top:${labelTop}px;color:${tint(windowColor, 1)}">${text}</span>`;
+      const under = `<rect x="${r1(x0 - 1)}" y="${top - 4}" width="${r1(Math.max(x1 - x0 + 2, 2))}" height="${r1(H + 4)}" rx="3" fill="${blockColor}" fill-opacity="0.22" stroke="${blockColor}" stroke-opacity="0.55" stroke-width="1"/>`;
+      const streak = `<rect x="${r1(x0 - 1)}" y="${r1(bottom + 3)}" width="${r1(Math.max(x1 - x0 + 2, 2))}" height="3" rx="1.5" fill="${blockColor}"/>`;
+      const text = labelText === null ? "" : (labelText !== undefined ? labelText : `${esc(this._t("legend_charge"))} ${f.time(startMs)}`);
+      const label = text ? `<span class="plabel" style="left:${r1(clamp((x0 + x1) / 2, X0 + 30, W - 30))}px;top:${labelTop}px;color:${tint(blockColor, 1)}">${text}</span>` : "";
       return { under, streak, label, inRange };
     };
     const blockA = hasWindow ? drawWindow(win.startUnit, win.durationUnits, 0) : { under: "", streak: "", label: "", inRange: () => false };
@@ -466,10 +520,18 @@ class HouseboatPriceCard extends HTMLElement {
     // close block A and block B land on the time axis at this card's
     // width - see the `top`/winB sizing comment above.
     const blockB = winB ? drawWindow(winB.startUnit, winB.durationUnits, 12) : { under: "", streak: "", label: "", inRange: () => false };
-    const inWindow = (i) => blockA.inRange(i) || blockB.inRange(i);
+    // Today's already-finished charging sessions (state history, loaded
+    // by _loadHistory above) - same shaded-band/streak look as the
+    // planned window (blockA/blockB), just without its own time label,
+    // so the chart reads as "charging happened here" both looking back
+    // and looking ahead without the two kinds of block looking different.
+    const historyBlocks = opt.show_history === false ? [] : (this._history || []).map((seg) =>
+      drawWindow((seg.from - T0) / unitMs, (seg.to - seg.from) / unitMs, 0, opt.buy_color, null)
+    );
+    const inWindow = (i) => blockA.inRange(i) || blockB.inRange(i) || historyBlocks.some((b) => b.inRange(i));
     const all = [...Array(n).keys()];
-    const under = blockA.under + blockB.under;
-    const streaks = blockA.streak + blockB.streak;
+    const under = blockA.under + blockB.under + historyBlocks.map((b) => b.under).join("");
+    const streaks = blockA.streak + blockB.streak + historyBlocks.map((b) => b.streak).join("");
     let labels = blockA.label + blockB.label;
     const bg = "var(--ha-card-background, var(--card-background-color, #1c1e24))";
     // Tomorrow's prices usually aren't published until mid-afternoon - the
