@@ -1,0 +1,29 @@
+# Home Assistant's hassfest (manifest, translations, config flow) - only
+# checks, nothing is published or changed.
+#
+# The HACS default-list action (repository license/topics/brand-asset
+# checks) used to run here too, but those only matter for submitting this
+# repo to the public HACS store - this is a personal/family install added
+# via "Custom repositories" in HACS, so that job was removed rather than
+# chasing green checks nobody needs. Re-add it (see git history) if this
+# repo is ever submitted to the HACS default store.
+name: Validate
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  validate-hassfest:
+    runs-on: "ubuntu-latest"
+    permissions:
+      contents: read
+    steps:
+      - uses: "actions/checkout@v4"
+      - name: Hassfest validation
+        uses: "home-assistant/actions/hassfest@master"

@@ -503,6 +503,62 @@ class HouseboatPriceCard extends HTMLElement {
     const price14d = num(attrs.price_14d_average);
     const socNow = num(attrs.current_soc);
     const canProject = floorSoc !== null && ceilingSoc !== null && ceilingSoc > floorSoc && price14d !== null && socNow !== null;
+    // Projected SoC waypoints (now -> drain down to soc_at_window_start ->
+    // rise through the charge window(s), split proportionally by duration
+    // when the plan is a chosen split -> drain again for the rest of the
+    // chart) - shared by the price-limit line below AND the SoC line
+    // further down. Previously the price-limit line projected SoC with its
+    // own naive "always draining" formula, completely ignoring the charge
+    // window(s) - so it kept climbing right through a planned charge
+    // instead of dropping the way the real sensor's own price_limit does
+    // as SoC rises (price_limit is a function of SoC: it falls as the
+    // battery fills, which is exactly what makes a charge window "use up"
+    // the willingness to pay more). Timo pointed out exactly this mismatch
+    // against the SoC line, which already modeled the rise correctly -
+    // fixed by computing the projected-SoC waypoints once and having both
+    // lines read from the same source instead of disagreeing with each
+    // other (2026-10).
+    const floorForDrain = floorSoc !== null ? floorSoc : 0;
+    const socWaypoints = socNow === null ? null : (() => {
+      const pts = [{ i: cur, soc: socNow }];
+      if (hasWindow) {
+        const aStart = Math.max(win.startUnit, cur);
+        const aEnd = Math.max(win.startUnit + win.durationUnits, aStart);
+        const atStart = num(attrs.soc_at_window_start);
+        const startSoc = aStart > cur
+          ? (atStart !== null ? atStart : Math.max(socNow - drainPerUnit * (aStart - cur), floorForDrain))
+          : socNow;
+        pts.push({ i: aStart, soc: startSoc });
+        const endSoc = num(attrs.projected_end_soc);
+        if (winB && winB.durationUnits > 0) {
+          const bStart = Math.max(winB.startUnit, aEnd);
+          const bEnd = Math.max(winB.startUnit + winB.durationUnits, bStart);
+          const totalDur = Math.max(win.durationUnits + winB.durationUnits, 1);
+          const totalRise = endSoc !== null ? endSoc - startSoc : 0;
+          const afterA = startSoc + totalRise * (win.durationUnits / totalDur);
+          pts.push({ i: aEnd, soc: afterA });
+          pts.push({ i: bStart, soc: afterA });
+          pts.push({ i: bEnd, soc: endSoc !== null ? endSoc : afterA });
+        } else {
+          pts.push({ i: aEnd, soc: endSoc !== null ? endSoc : startSoc });
+        }
+      }
+      const last = pts[pts.length - 1];
+      if (last.i < n) pts.push({ i: n, soc: Math.max(last.soc - drainPerUnit * (n - last.i), floorForDrain) });
+      return pts;
+    })();
+    // Piecewise-linear lookup over socWaypoints for an arbitrary unit index
+    // (the price-limit line needs SoC at every unit, not just at the
+    // waypoints themselves).
+    const socAt = (i) => {
+      if (!socWaypoints || !socWaypoints.length) return socNow;
+      if (i <= socWaypoints[0].i) return socWaypoints[0].soc;
+      for (let k = 0; k < socWaypoints.length - 1; k++) {
+        const p0 = socWaypoints[k], p1 = socWaypoints[k + 1];
+        if (i <= p1.i) return p1.i === p0.i ? p1.soc : p0.soc + (p1.soc - p0.soc) * ((i - p0.i) / (p1.i - p0.i));
+      }
+      return socWaypoints[socWaypoints.length - 1].soc;
+    };
     let lo = Math.min(0, ...valid, limitVal !== null ? limitVal : 0);
     let hi = Math.max(...valid, limitVal !== null ? limitVal : 0, canProject ? price14d : 0);
     const steps = [0.01, 0.02, 0.05, 0.1, 0.2, 0.25, 0.5, 1, 2, 5];
@@ -596,8 +652,7 @@ class HouseboatPriceCard extends HTMLElement {
     if (canProject) {
       let d = "";
       for (let i = cur; i < n; i++) {
-        const unitsAhead = i - cur;
-        const projSoc = Math.max(socNow - drainPerUnit * unitsAhead, floorSoc);
+        const projSoc = clamp(socAt(i), floorSoc, ceilingSoc);
         const mult = clamp(1 - (projSoc - floorSoc) / (ceilingSoc - floorSoc), 0, 1);
         const v = price14d * mult;
         d += `${i === cur ? "M" : "L"}${r1(xi(i) + bw / 2)} ${r1(y(v))}`;
@@ -613,21 +668,17 @@ class HouseboatPriceCard extends HTMLElement {
     // before `now`) joined to a forward PROJECTION of where the battery
     // is headed given the current plan (dashed, same convention as the
     // price-limit line above - it's an estimate, not a measurement).
-    // Projection waypoints: now (live soc) -> drain down to
-    // soc_at_window_start (same figure/formula the sensor itself already
-    // exposes) -> rise through the charge window(s) to projected_end_soc,
-    // flat through a split's pause -> drain again from there for the
-    // rest of the chart. A chosen split's rise is shared between block A
-    // and block B by DURATION (not real energy - the sensor doesn't
-    // expose each block's own kWh separately), a fair approximation
-    // since the charge rate is roughly constant throughout.
+    // Projection waypoints come from socWaypoints, computed earlier (now
+    // shared with the price-limit line above - see its own comment for
+    // why): now (live soc) -> drain down to soc_at_window_start -> rise
+    // through the charge window(s) to projected_end_soc, flat through a
+    // split's pause -> drain again from there for the rest of the chart.
     const ySoc = (v) => top + ((100 - clamp(v, 0, 100)) / 100) * H;
     let socPastLine = "";
     let socFutureLine = "";
     let socAxis = "";
     const showSoc = opt.show_soc !== false && socNow !== null;
     if (showSoc) {
-      const floorForDrain = floorSoc !== null ? floorSoc : 0;
       const pathFrom = (pts) => pts
         .map((p, idx) => `${idx === 0 ? "M" : "L"}${r1(xi(clamp(p.i, 0, n)) + bw / 2)} ${r1(ySoc(p.soc))}`)
         .join("");
@@ -644,36 +695,7 @@ class HouseboatPriceCard extends HTMLElement {
         socPastLine = `<path d="${pathFrom(histPts)}" fill="none" style="stroke:${opt.soc_color}" stroke-width="1.8"/>`;
       }
 
-      const pts = [{ i: cur, soc: socNow }];
-      // Window start/end clamped to >= now: once charging has actually
-      // started, win.startUnit (charge_plan_start_unit) can already sit
-      // in the past - there's no drain leg to draw in that case, the
-      // curve should pick straight up from socNow into the rise.
-      if (hasWindow) {
-        const aStart = Math.max(win.startUnit, cur);
-        const aEnd = Math.max(win.startUnit + win.durationUnits, aStart);
-        const atStart = num(attrs.soc_at_window_start);
-        const startSoc = aStart > cur
-          ? (atStart !== null ? atStart : Math.max(socNow - drainPerUnit * (aStart - cur), floorForDrain))
-          : socNow;
-        pts.push({ i: aStart, soc: startSoc });
-        const endSoc = num(attrs.projected_end_soc);
-        if (winB && winB.durationUnits > 0) {
-          const bStart = Math.max(winB.startUnit, aEnd);
-          const bEnd = Math.max(winB.startUnit + winB.durationUnits, bStart);
-          const totalDur = Math.max(win.durationUnits + winB.durationUnits, 1);
-          const totalRise = endSoc !== null ? endSoc - startSoc : 0;
-          const afterA = startSoc + totalRise * (win.durationUnits / totalDur);
-          pts.push({ i: aEnd, soc: afterA });
-          pts.push({ i: bStart, soc: afterA });
-          pts.push({ i: bEnd, soc: endSoc !== null ? endSoc : afterA });
-        } else {
-          pts.push({ i: aEnd, soc: endSoc !== null ? endSoc : startSoc });
-        }
-      }
-      const last = pts[pts.length - 1];
-      if (last.i < n) pts.push({ i: n, soc: Math.max(last.soc - drainPerUnit * (n - last.i), floorForDrain) });
-      socFutureLine = `<path d="${pathFrom(pts)}" fill="none" style="stroke:${opt.soc_color}" stroke-width="1.8" stroke-dasharray="5 3"/>`;
+      socFutureLine = `<path d="${pathFrom(socWaypoints)}" fill="none" style="stroke:${opt.soc_color}" stroke-width="1.8" stroke-dasharray="5 3"/>`;
       socAxis = [0, 50, 100].map((v) =>
         `<text x="${W}" y="${r1(ySoc(v) + 3)}" text-anchor="end" fill="${opt.soc_color}" fill-opacity="0.8">${v}%</text>`
       ).join("");

@@ -176,6 +176,16 @@ DEFAULT_IS_DRAWING_ANY_POWER_THRESHOLD_W = 100.0
 NUM_HIGH_SHORE_LOAD_THRESHOLD_W = "high_shore_load_threshold_w"
 DEFAULT_HIGH_SHORE_LOAD_THRESHOLD_W = 500.0
 
+# How negative the live price must be before opportunistic charging kicks
+# in (is_price_negative, REASON_PRICE_NEGATIVE). Was a hardcoded "< 0.0" -
+# 2026.10.25: with a flat 0.0 threshold, charging would start/keep running
+# on any price that dipped even a fraction of a cent below zero, which is
+# noise-prone (price feeds can wobble a few tenths of a cent around zero).
+# Default moved to -0.05 €/kWh so a real, worthwhile negative price is
+# required before it overrides the normal plan/stop conditions.
+NUM_PRICE_NEGATIVE_THRESHOLD = "price_negative_threshold"
+DEFAULT_PRICE_NEGATIVE_THRESHOLD = -0.05
+
 NUM_SOC_CRITICAL_PERCENT = "soc_critical_percent"
 DEFAULT_SOC_CRITICAL_PERCENT = 40.0
 
@@ -226,6 +236,7 @@ NUMBER_DEFINITIONS: tuple[tuple, ...] = (
     (NUM_IS_CHARGING_THRESHOLD_W, DEFAULT_IS_CHARGING_THRESHOLD_W, "W", 0, 5000, 10, "mdi:power-plug", "Charging-detected threshold"),
     (NUM_IS_DRAWING_ANY_POWER_THRESHOLD_W, DEFAULT_IS_DRAWING_ANY_POWER_THRESHOLD_W, "W", 0, 5000, 10, "mdi:power-plug-outline", "Any-draw-detected threshold"),
     (NUM_HIGH_SHORE_LOAD_THRESHOLD_W, DEFAULT_HIGH_SHORE_LOAD_THRESHOLD_W, "W", 0, 5000, 10, "mdi:power-plug", "High shore-load threshold"),
+    (NUM_PRICE_NEGATIVE_THRESHOLD, DEFAULT_PRICE_NEGATIVE_THRESHOLD, "€/kWh", -1.0, 0, 0.01, "mdi:currency-eur", "Negative-price charging threshold"),
     (NUM_SOC_CRITICAL_PERCENT, DEFAULT_SOC_CRITICAL_PERCENT, "%", 0, 100, 1, "mdi:battery-alert", "Critical SoC threshold"),
     (NUM_VACATION_DEPARTURE_TARGET_DAYS, DEFAULT_VACATION_DEPARTURE_TARGET_DAYS, "d", 1, 15, 1, "mdi:calendar-clock", "Vacation departure runway (days)"),
     (NUM_VACATION_DEPARTURE_BUFFER_HOURS, DEFAULT_VACATION_DEPARTURE_BUFFER_HOURS, "h", 0, 12, 0.5, "mdi:timer-sand", "Vacation departure buffer"),

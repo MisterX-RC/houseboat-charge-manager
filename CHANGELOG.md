@@ -13,6 +13,96 @@ Versions are **year.month.release**, like ESS Manager's own (as of
 the releases in that month from 0 - `2026.10.0`, `2026.10.1`, ...,
 `2026.11.0`.
 
+## [2026.10.25] - 2026-10-25
+
+### Added
+- **New tunable: "Negative-price charging threshold"** (`price_negative_threshold`,
+  default **-0.05 €/kWh**). Timo noticed the system had just started an
+  opportunistic charge session purely because the live price ticked
+  fractionally below zero, and asked for a bit more margin: "Die prijs
+  moet wel iets verder negatief zijn" - any price under 0.0 was enough to
+  trigger `is_price_negative` (and override the normal plan/stop
+  conditions for as long as it held), which is noise-prone since price
+  feeds can wobble a few tenths of a cent either side of zero. The check
+  (`logic.py`, `is_price_negative`) now compares against this new number
+  entity instead of a hardcoded `0.0`, so a real, worthwhile dip is
+  required before forced charging kicks in - set it back to 0 to restore
+  the old "any negative price" behavior. Shows up as a new number entity
+  in Settings -> Devices & services -> Houseboat Charge Manager, grouped
+  with the other live-decision thresholds (charging-detected, any-draw,
+  high shore-load).
+
+## [2026.10.24] - 2026-10-24
+
+### Fixed
+- **No, the engine did not correctly handle the DST "fall back" change**
+  (Timo asked specifically, prompted by today's Nordpool data visibly
+  having more price blocks than usual - the 2026-10-25 day genuinely has
+  100 15-minute slots, not the usual 96, since local clocks repeat the
+  02:00-03:00 hour). `interval_start_unit` - the position used to index
+  into `price_today`/`price_tomorrow` for literally everything the engine
+  decides - was computed as `now.hour * 4 + now.minute // 15 + 1`, naive
+  wall-clock arithmetic that can't tell the repeated hour's two
+  occurrences apart. From the transition onward for the rest of that day,
+  this read a flat 1 hour (4 units) behind where it should, i.e. the
+  engine would plan and judge prices against the PREVIOUS hour's slot
+  instead of the real current one, self-correcting only at the next local
+  midnight. Same root problem (a flat `UNITS_PER_DAY=96` assumed for every
+  day) also affected `_fmt_unit_clock` (unit-to-clock-time display - units
+  96-99, the long day's genuinely-still-today extra hour, rendered as
+  "Morgen 00:00"-"00:45" instead of "23:00"-"23:45") and `_rebase_unit` (a
+  locked plan surviving the night's own midnight would have been
+  rebased by the wrong, flat 96 instead of the real 100).
+
+  Fixed by switching all three to real-elapsed-time arithmetic off two
+  genuine timezone-aware datetimes instead of flat unit-count assumptions
+  - new `_units_since_midnight`/`_real_minutes_between`/`_add_real_minutes`
+  helpers. Caught and fixed a second bug while building this: plain `-`/`+`
+  on two AWARE datetimes with a fold-aware tzinfo (zoneinfo) is *not*
+  reliably DST-correct in CPython either (confirmed empirically - it
+  silently drops the extra folded hour), so these go through `.timestamp()`
+  instead, which doesn't have that problem; naive (no-tzinfo) datetimes -
+  used throughout this project's own test scripts - keep plain
+  subtraction/addition, unaffected, with no DST concept to get right in
+  the first place. Verified: a dedicated DST simulation script confirming
+  correct unit counts/clock labels/rebasing across the actual 2026-10-25
+  transition (including the ambiguous 02:00-03:00 hour's two distinct
+  `fold` values), a full end-to-end `compute()` run with a realistic
+  100-entry price array for that day confirming the right price slot gets
+  read as "now", and a before/after diff against the previously-shipped
+  logic.py across a wide spread of ordinary (non-DST) times and an
+  ordinary midnight-crossing locked-plan scenario, confirming zero
+  behavior change there.
+
+  Known follow-up, NOT included here: the price chart's own x-axis still
+  spaces price bars evenly by array index assuming a flat 96-per-day,
+  while the "now" line and charge-window highlighting are positioned by
+  real elapsed time - on this one day a year they can visually drift
+  apart by up to an hour for the portion of the chart after the
+  transition (self-corrects the next day). This is cosmetic only, not
+  part of the planning engine the fixes above cover - flag it if you want
+  that looked at separately.
+
+## [2026.10.23] - 2026-10-24
+
+### Fixed
+- **Price card: the "Prijslimiet" projection line ignored the charge plan
+  entirely.** It projected SoC forward with its own simple "always
+  draining" formula - so while the SoC line correctly showed SoC rising
+  during a planned charge window, the price-limit line kept climbing
+  straight through that same window as if SoC were still dropping, even
+  though price_limit is itself a function of SoC and should fall as SoC
+  rises (a fuller battery lowers how much you're willing to pay). The two
+  lines visibly disagreed about what SoC was doing at the same point in
+  time (Timo noticed this comparing them side by side). Fixed by having
+  both lines read from one shared set of projected-SoC waypoints (now ->
+  drain to soc_at_window_start -> rise through the charge window(s),
+  split proportionally for a split plan -> drain again to the end of the
+  48h horizon) instead of each computing - and disagreeing on - its own.
+  The price-limit line now dips during a planned charge window and rises
+  again afterward, matching the SoC line's shape inverted, same as the
+  sensor's own price_limit genuinely behaves.
+
 ## [2026.10.22] - 2026-10-24
 
 ### Fixed

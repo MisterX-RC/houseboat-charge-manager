@@ -34,7 +34,7 @@ Assistant restart, and calling this function every UPDATE_INTERVAL_SECONDS.
 from __future__ import annotations
 
 import math
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from statistics import mean
 from typing import Any, Optional
 
@@ -55,6 +55,7 @@ from .const import (
     NUM_IS_CHARGING_THRESHOLD_W,
     NUM_IS_DRAWING_ANY_POWER_THRESHOLD_W,
     NUM_LOW_SOC_SEARCH_HORIZON_HOURS,
+    NUM_PRICE_NEGATIVE_THRESHOLD,
     NUM_SESSION_CAP_HOURS,
     NUM_SESSION_CAP_LOW_SOC_HOURS,
     NUM_SOC_CEILING_PERCENT,
@@ -161,26 +162,93 @@ def _is_plain_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
+def _local_midnight(now: datetime) -> datetime:
+    return now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _real_minutes_between(start: datetime, end: datetime) -> float:
+    """Real elapsed minutes from `start` to `end`, DST-correct for
+    timezone-aware datetimes (2026-10, DST fix).
+
+    Plain `end - start` subtraction is naive wall-clock math 1 day/hour
+    level up from `now.hour * 4 + now.minute // 15` (interval_start_unit's
+    own old formula, see _units_since_midnight below) - and *importantly*,
+    direct subtraction of two AWARE datetimes with a fold-aware tzinfo
+    (zoneinfo) is NOT reliably DST-correct in CPython either, confirmed
+    empirically while building this fix: on 2026-10-25 (a "fall back"
+    day), `datetime(2026,10,25,2,30,tzinfo=TZ,fold=1) - local_midnight`
+    via plain `-` gives 2h30m, when the real elapsed time is 3h30m (the
+    extra folded hour silently disappears). `.timestamp()` (POSIX seconds,
+    correctly fold-aware) doesn't have this problem, so aware datetimes go
+    through it instead. Naive datetimes (no tzinfo - used throughout this
+    module's own test scripts, and with no DST concept to get right in the
+    first place) keep plain subtraction: `.timestamp()` on a naive
+    datetime assumes the HOST machine's own local timezone, which has
+    nothing to do with whatever `now` is meant to represent here.
+    """
+    if start.tzinfo is None or end.tzinfo is None:
+        return (end - start).total_seconds() / 60
+    return (end.timestamp() - start.timestamp()) / 60
+
+
+def _add_real_minutes(start: datetime, minutes: float) -> datetime:
+    """`start` plus `minutes` of REAL elapsed time, DST-correct for aware
+    datetimes - the addition-side counterpart to _real_minutes_between
+    (2026-10, DST fix). `start + timedelta(minutes=...)` has the mirror
+    problem: it adds to the naive wall-clock fields assuming every day in
+    between is a flat 24h, so a span that crosses a DST-change day lands
+    exactly 1 hour off (confirmed empirically the same way). Going through
+    `.timestamp()` and back avoids that; naive datetimes keep plain
+    timedelta addition, same reasoning as _real_minutes_between.
+    """
+    if start.tzinfo is None:
+        return start + timedelta(minutes=minutes)
+    return datetime.fromtimestamp(start.timestamp() + minutes * 60, tz=start.tzinfo)
+
+
+def _units_since_midnight(now: datetime) -> int:
+    """How many whole 15-minute units have elapsed since local midnight of
+    `now`'s date, in REAL elapsed time rather than naive
+    `now.hour * 4 + now.minute // 15` arithmetic (2026-10, DST fix).
+
+    Those agree on an ordinary 96-unit day, but naive wall-clock math is
+    wrong on the day of a DST change: `now.hour`/`now.minute` can't tell
+    the two occurrences of the repeated hour on a "fall back" day apart
+    (so from the transition onward it reads a flat 1 hour/4 units behind
+    for the rest of that day), and it would equally undercount the missing
+    hour the other way on a "spring forward" day. This reads the true
+    number of 15-minute slots that have elapsed (see _real_minutes_between
+    for how), which has to line up with Nordpool's own `today` price
+    array: that array genuinely has 100 entries on a fall-back day and 92
+    on a spring-forward one, not a flat 96, and `now` must be indexed into
+    it accordingly.
+    """
+    return int(_real_minutes_between(_local_midnight(now), now) // UNIT_MINUTES)
+
+
 def _fmt_unit_clock(unit: int, now: datetime) -> str:
     """Render a 15-minute unit index (0 = midnight of `now`'s date) as a
     clock time, with a day-aware prefix. Uses real calendar-date math
-    (divmod against `now`'s date), not a single "past unit 96 = tomorrow"
-    check - that only ever handled one day ahead and silently produced
-    garbage for anything further out (now a real possibility - see the
-    flat-block extension) or for a unit that's actually in the past (a
-    locked plan read after it should already be rebased - see
-    _rebase_unit - but this stays correct even if it somehow isn't).
+    (walking forward from `now`'s actual local midnight by `unit * 15`
+    REAL minutes via _add_real_minutes, not a `divmod(unit, 96)` against a
+    flat 96-units-per-day assumption - fixed 2026-10, see
+    _units_since_midnight for why a flat 96 is wrong on a DST-change day),
+    not a single "past unit 96 = tomorrow" check - that only ever handled
+    one day ahead and silently produced garbage for anything further out
+    (now a real possibility - see the flat-block extension) or for a unit
+    that's actually in the past (a locked plan read after it should
+    already be rebased - see _rebase_unit - but this stays correct even if
+    it somehow isn't).
     """
-    day_offset, unit_of_day = divmod(unit, UNITS_PER_DAY)
-    hour = unit_of_day // UNITS_PER_HOUR
-    minute = (unit_of_day - hour * UNITS_PER_HOUR) * UNIT_MINUTES
+    target = _add_real_minutes(_local_midnight(now), unit * UNIT_MINUTES)
+    day_offset = (target.date() - now.date()).days
     if day_offset == 0:
         prefix = ""
     elif day_offset == 1:
         prefix = "Morgen "
     else:
-        prefix = f"{(now.date() + timedelta(days=day_offset)).strftime('%d-%m')} "
-    return f"{prefix}{hour:02d}:{minute:02d}"
+        prefix = f"{target.strftime('%d-%m')} "
+    return f"{prefix}{target.strftime('%H:%M')}"
 
 
 def _rebase_unit(value: Optional[float], reference_date_str: Optional[str], now: datetime) -> Optional[float]:
@@ -200,6 +268,13 @@ def _rebase_unit(value: Optional[float], reference_date_str: Optional[str], now:
     suddenly jump UP by about a day's worth of units, and the displayed
     stop time can show the wrong day. Rebasing on every read (not just
     once) keeps this correct across any number of consecutive midnights.
+
+    The shift itself is computed from the real elapsed time between the
+    two midnights (via _real_minutes_between, DST-correct), not
+    `days_elapsed * UNITS_PER_DAY` (fixed 2026-10) - a flat 96-per-day
+    multiply is wrong for any rebase that crosses a DST-change day, since
+    that one day actually has 100 units (fall back) or 92 (spring
+    forward), not 96.
     """
     if value is None:
         return None
@@ -209,8 +284,11 @@ def _rebase_unit(value: Optional[float], reference_date_str: Optional[str], now:
         reference_date = date.fromisoformat(reference_date_str)
     except (TypeError, ValueError):
         return value
-    days_elapsed = (now.date() - reference_date).days
-    return value if days_elapsed == 0 else value - days_elapsed * UNITS_PER_DAY
+    if reference_date == now.date():
+        return value
+    reference_midnight = datetime.combine(reference_date, time.min, tzinfo=now.tzinfo)
+    elapsed_units = round(_real_minutes_between(reference_midnight, _local_midnight(now)) / UNIT_MINUTES)
+    return value - elapsed_units
 
 
 def _best_two_block_split(
@@ -421,7 +499,7 @@ def compute(
     r["is_grid_unavailable"] = is_grid_unavailable
     is_100_percent_mode = is_force_full_charge
     r["is_100_percent_mode"] = is_100_percent_mode
-    is_price_negative = price_current < 0.0
+    is_price_negative = price_current < T[NUM_PRICE_NEGATIVE_THRESHOLD]
     r["is_price_negative"] = is_price_negative
 
     # ---------------------------------------------------------------
@@ -706,7 +784,11 @@ def compute(
     # ---------------------------------------------------------------
     # PRICE DATA
     # ---------------------------------------------------------------
-    interval_start_unit = int(now.minute // 15) + (now.hour * 4) + 1
+    # DST fix (2026-10): was `int(now.minute // 15) + (now.hour * 4) + 1`,
+    # naive wall-clock arithmetic that reads 1 hour/4 units behind for most
+    # of a "fall back" DST-change day (now.hour can't tell the repeated
+    # hour's two occurrences apart) - see _units_since_midnight.
+    interval_start_unit = _units_since_midnight(now) + 1
     r["interval_start_unit"] = interval_start_unit
     all_price = list(price_today or []) + list(price_tomorrow or [])
     r["all_price"] = all_price
@@ -735,7 +817,18 @@ def compute(
     # low_battery_percentage is actually at risk.
     normal_horizon = 0 if shore_power_w > T[NUM_HIGH_SHORE_LOAD_THRESHOLD_W] else len(interval_price)
     if is_voyage_pending and not is_vacation_mode:
-        units_into_hour = interval_start_unit - (now.hour * 4)
+        # Units already into the current wall-clock hour, for rounding the
+        # voyage deadline down to the top of the hour below. Equivalent to
+        # the original `interval_start_unit - now.hour * 4` on an ordinary
+        # day (the `now.hour * 4` term cancels exactly against the same
+        # term inside interval_start_unit's own old formula) - written
+        # directly as `now.minute // 15 + 1` instead (2026-10, DST fix) so
+        # it no longer depends on that cancellation, which stopped holding
+        # once interval_start_unit switched to real elapsed-time math
+        # (_units_since_midnight): minutes-within-an-hour are never
+        # DST-ambiguous, so this is correct on every day without needing
+        # `now.hour` at all.
+        units_into_hour = now.minute // 15 + 1
         voyage_deadline_units = round(start_voyage_hours * 4) - units_into_hour
         voyage_horizon = max(voyage_deadline_units, 0)
         last_considered_interval_index = min(normal_horizon, voyage_horizon)
