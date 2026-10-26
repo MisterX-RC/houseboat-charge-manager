@@ -518,35 +518,89 @@ class HouseboatPriceCard extends HTMLElement {
     // fixed by computing the projected-SoC waypoints once and having both
     // lines read from the same source instead of disagreeing with each
     // other (2026-10).
+    //
+    // 2026-10-26: this used to assume block A ALWAYS executes and just
+    // split the rise proportionally between A and B - but block A's own
+    // `favorable` flag (windowPrice <= priceLimit at its start) can
+    // already say "no, A's average price doesn't actually clear the
+    // limit by the time it would start" - Timo spotted exactly this on
+    // the chart (A shown unfavorable/red) and pointed out two things:
+    // (1) block B was still being colored off A's favorable flag, never
+    // its own, and (2) the projected curve kept rising through A anyway,
+    // which then drags B's own baseline SoC up too far to look
+    // achievable - "als ik de stijgende lijn doortrek alsof de eerste
+    // sessie niet bestaat gaat hij [B] die denk ik wel pakken." Fixed by
+    // judging each window's favorability independently - B's own average
+    // price against the limit AT B's OWN start, projected as if A is
+    // skipped (pure drain through A's slot) - and only letting a window
+    // contribute to the projected rise when ITS OWN favorable check
+    // passes. Whichever window(s) actually clear their own bar carry the
+    // full rise to projected_end_soc; a skipped window just drains like
+    // any other idle period.
     const floorForDrain = floorSoc !== null ? floorSoc : 0;
+    const limitMultAt = (soc) => clamp(1 - (soc - floorSoc) / (ceilingSoc - floorSoc), 0, 1);
+    const aFavorable = hasWindow && win.favorable;
+    let bFavorable = false;
     const socWaypoints = socNow === null ? null : (() => {
       const pts = [{ i: cur, soc: socNow }];
       if (hasWindow) {
         const aStart = Math.max(win.startUnit, cur);
         const aEnd = Math.max(win.startUnit + win.durationUnits, aStart);
         const atStart = num(attrs.soc_at_window_start);
-        const startSoc = aStart > cur
+        const naturalAStart = aStart > cur
           ? (atStart !== null ? atStart : Math.max(socNow - drainPerUnit * (aStart - cur), floorForDrain))
           : socNow;
-        pts.push({ i: aStart, soc: startSoc });
         const endSoc = num(attrs.projected_end_soc);
         if (winB && winB.durationUnits > 0) {
           const bStart = Math.max(winB.startUnit, aEnd);
           const bEnd = Math.max(winB.startUnit + winB.durationUnits, bStart);
-          const totalDur = Math.max(win.durationUnits + winB.durationUnits, 1);
-          const totalRise = endSoc !== null ? endSoc - startSoc : 0;
-          const afterA = startSoc + totalRise * (win.durationUnits / totalDur);
-          pts.push({ i: aEnd, soc: afterA });
-          pts.push({ i: bStart, soc: afterA });
-          pts.push({ i: bEnd, soc: endSoc !== null ? endSoc : afterA });
+          // B's own baseline, assuming A does NOT charge (straight drain
+          // from A's start through to B's start) - this, not the
+          // "A already charged" baseline, is what B's own price has to
+          // beat; otherwise a skipped A silently drags B down with it.
+          const bStartIfANoop = Math.max(naturalAStart - drainPerUnit * (bStart - aStart), floorForDrain);
+          const windowPriceB = attrs.pending_plan_b_average_price != null
+            ? Number(attrs.pending_plan_b_average_price)
+            : (Number(attrs.split_b_average_price) || 0);
+          bFavorable = canProject ? windowPriceB <= price14d * limitMultAt(bStartIfANoop) : aFavorable;
+
+          if (aFavorable && bFavorable) {
+            // Both clear their own bar: split the total rise
+            // proportionally by duration, as before.
+            pts.push({ i: aStart, soc: naturalAStart });
+            const totalDur = Math.max(win.durationUnits + winB.durationUnits, 1);
+            const totalRise = endSoc !== null ? endSoc - naturalAStart : 0;
+            const afterA = naturalAStart + totalRise * (win.durationUnits / totalDur);
+            pts.push({ i: aEnd, soc: afterA });
+            pts.push({ i: bStart, soc: afterA });
+            pts.push({ i: bEnd, soc: endSoc !== null ? endSoc : afterA });
+          } else if (aFavorable) {
+            // Only A clears its bar: A alone carries the full rise, B
+            // stays flat/draining (shown unfavorable/red).
+            pts.push({ i: aStart, soc: naturalAStart });
+            pts.push({ i: aEnd, soc: endSoc !== null ? endSoc : naturalAStart });
+          } else if (bFavorable) {
+            // A is skipped: keep draining straight through its slot, B
+            // alone then carries the full rise to the target.
+            pts.push({ i: bStart, soc: bStartIfANoop });
+            pts.push({ i: bEnd, soc: endSoc !== null ? endSoc : bStartIfANoop });
+          } else {
+            // Neither clears its own bar right now - nothing charges in
+            // this projection, keep draining through both slots.
+            pts.push({ i: bEnd, soc: Math.max(bStartIfANoop - drainPerUnit * (bEnd - bStart), floorForDrain) });
+          }
         } else {
-          pts.push({ i: aEnd, soc: endSoc !== null ? endSoc : startSoc });
+          // No split - single window, unchanged except it only rises
+          // when it actually clears its own bar.
+          pts.push({ i: aStart, soc: naturalAStart });
+          pts.push({ i: aEnd, soc: aFavorable ? (endSoc !== null ? endSoc : naturalAStart) : naturalAStart });
         }
       }
       const last = pts[pts.length - 1];
       if (last.i < n) pts.push({ i: n, soc: Math.max(last.soc - drainPerUnit * (n - last.i), floorForDrain) });
       return pts;
     })();
+    const windowColorB = bFavorable ? opt.buy_color : "#ff5252";
     // Piecewise-linear lookup over socWaypoints for an arbitrary unit index
     // (the price-limit line needs SoC at every unit, not just at the
     // waypoints themselves).
@@ -618,7 +672,7 @@ class HouseboatPriceCard extends HTMLElement {
     // a split is in play, so the two never overlap regardless of how
     // close block A and block B land on the time axis at this card's
     // width - see the `top`/winB sizing comment above.
-    const blockB = winB ? drawWindow(winB.startUnit, winB.durationUnits, 12) : { under: "", streak: "", label: "", inRange: () => false };
+    const blockB = winB ? drawWindow(winB.startUnit, winB.durationUnits, 12, windowColorB) : { under: "", streak: "", label: "", inRange: () => false };
     // Today's already-finished charging sessions (state history, loaded
     // by _loadHistory above) - same shaded-band/streak look as the
     // planned window (blockA/blockB), just without its own time label,

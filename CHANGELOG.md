@@ -13,6 +13,35 @@ Versions are **year.month.release**, like ESS Manager's own (as of
 the releases in that month from 0 - `2026.10.0`, `2026.10.1`, ...,
 `2026.11.0`.
 
+## [2026.10.26] - 2026-10-26
+
+### Fixed
+- **Price card: block B of a split session was always colored off block A's
+  favorability, never its own.** Timo noticed on the live chart that the
+  first (nearer) charge block was clearly going to be skipped - its average
+  price doesn't clear `price_limit_at_window_start` - yet the card's
+  projected price-limit/SoC curve still rose through it as if it would
+  charge, and the second block was shown the same color as the first
+  regardless of whether its own, much cheaper price would actually clear
+  the limit by the time it starts. Root cause, both symptoms: `drawWindow`
+  for block B never got its own color (it silently fell back to block A's
+  `windowColor`), and the projected-SoC waypoints builder always assumed
+  block A executes, so block B's baseline SoC - and therefore the limit it
+  has to beat - was computed as if A had already charged, even when A's own
+  check says it won't. Fixed by judging each block's favorability
+  independently: block B's own average price (`split_b_average_price` /
+  `pending_plan_b_average_price`) is now compared against the price limit
+  projected at ITS OWN start, computed as if block A is skipped (straight
+  drain through A's slot) rather than inheriting A's assumed rise. Whichever
+  block(s) actually clear their own bar carry the full projected rise to
+  `projected_end_soc`; a skipped block just drains like any other idle
+  stretch. Verified against Timo's own live sensor dump (block A: 0.089
+  avg vs. 0.0756 limit - unfavorable/red; block B: 0.0611 avg vs. 0.1045
+  limit once correctly projected off the drained, not charged, baseline -
+  favorable/blue) via the Playwright card-preview harness - matches exactly
+  what Timo predicted by eye ("als ik de stijgende lijn doortrek alsof de
+  eerste sessie niet bestaat gaat hij die [tweede] denk ik wel pakken").
+
 ## [2026.10.25] - 2026-10-25
 
 ### Added
