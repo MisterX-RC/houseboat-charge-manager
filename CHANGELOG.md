@@ -13,6 +13,43 @@ Versions are **year.month.release**, like ESS Manager's own (as of
 the releases in that month from 0 - `2026.10.0`, `2026.10.1`, ...,
 `2026.11.0`.
 
+## [2026.10.30] - 2026-10-30
+
+### Fixed
+- **`soc_at_window_start` projected ABOVE the live SoC when the battery was
+  already below the floor.** Timo's battery was at 30.1% (floor 40%), an
+  imminent charge window (45 min out) was clearly going to be needed, but
+  the price card showed it red/unfavorable and the SoC line jumped
+  steeply up to the floor right before the window started, then stayed
+  flat through the whole thing instead of rising. Root cause (`logic.py`):
+  `soc_at_window_start = max(soc - drain_per_unit * units_ahead,
+  soc_floor)` - the floor was meant as a believable lower bound on a
+  short no-charging drain (if a pure drain would carry us past the floor,
+  the below-floor logic would already have intervened first) - but that
+  reasoning only holds when `soc` starts ABOVE the floor. Once `soc` is
+  already below it (`is_below_soc_floor`), `max(..., soc_floor)` instead
+  projects the SoC UPWARD to the floor regardless of how little time has
+  passed, which is backwards for a plain drain projection. That one
+  inflated value fed three things at once: `soc_at_window_start` itself
+  (30.1% -> a nonsensical 40%), `price_limit_at_window_start` (computed
+  as if SoC had already recovered to the floor, instead of the
+  more-lenient-than-floor limit a still-below-floor SoC should get), and
+  `is_soc_critical_at_window_start` (wrongly `False`, which suppressed
+  the critical-SoC override the price card uses to force a window
+  favorable regardless of price). Fixed by only applying the
+  floor-as-lower-bound when `soc >= soc_floor`; below the floor the drain
+  projection now continues naturally, bounded only at 0. Verified: the
+  above-floor case (where the old clamp-to-floor behavior is actually
+  correct) reproduces identically; the below-floor case now projects a
+  realistic ~29.96% instead of 40%, `price_limit_at_window_start` lands
+  within a cent of the live `price_limit` (as it should for a 45-minute
+  gap) instead of artificially low, and `is_soc_critical_at_window_start`
+  correctly flips to `True` - which is what actually fixes the price
+  card: the critical override now kicks in, the window renders blue, and
+  the SoC line rises smoothly through it instead of front-loading a fake
+  jump and flatlining. Confirmed against Timo's own live sensor dump via
+  the Playwright card-preview harness.
+
 ## [2026.10.26] - 2026-10-26
 
 ### Fixed

@@ -1582,8 +1582,29 @@ def compute(
     r["price_ceiling_multiplier"] = price_ceiling_multiplier
     r["price_limit"] = round(price_14d_average * price_ceiling_multiplier, 4)
 
+    # The floor is only a believable LOWER BOUND on this projection when we
+    # start ABOVE it: in that case, if a pure no-charging drain would carry
+    # us past the floor before the window even starts, something else
+    # (the below-floor logic itself) would already have intervened first,
+    # so clamping at soc_floor is a reasonable "this won't really happen"
+    # guard. 2026-10-30: when `soc` is ALREADY below the floor
+    # (is_below_soc_floor), that guard inverts into a bug - max(drained,
+    # soc_floor) then projects soc_at_window_start ABOVE the live soc
+    # (e.g. live 30.1% -> "projected" 40%, floor-flat, even just 45
+    # minutes out with nothing charging in between), which is physically
+    # backwards for a short no-charging gap. Timo caught this from the
+    # price card: the imminent window was shown red/unfavorable and the
+    # SoC line jumped steeply up to the floor before the window even
+    # started, then went flat through the whole window instead of rising -
+    # both traced back to this one inflated value (it also fed
+    # price_limit_at_window_start too low and is_soc_critical_at_window_start
+    # wrongly False, which is what suppressed the critical override that
+    # should have forced the window favorable). Below the floor, there is
+    # no such guard to apply - just let the drain projection continue,
+    # bounded only at 0.
     units_ahead = max(start_unit - interval_start_unit, 0)
-    soc_at_window_start = round(max(soc - drain_per_unit * units_ahead, soc_floor), 2)
+    soc_at_window_start_floor = soc_floor if soc >= soc_floor else 0.0
+    soc_at_window_start = round(max(soc - drain_per_unit * units_ahead, soc_at_window_start_floor), 2)
     r["soc_at_window_start"] = soc_at_window_start
     price_limit_at_window_start = round(
         price_14d_average * max(1 - ((soc_at_window_start - soc_floor) / (soc_ceiling - soc_floor)), 0), 4
