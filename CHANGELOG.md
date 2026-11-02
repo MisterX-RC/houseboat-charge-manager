@@ -13,6 +13,37 @@ Versions are **year.month.release**, like ESS Manager's own (as of
 the releases in that month from 0 - `2026.10.0`, `2026.10.1`, ...,
 `2026.11.0`.
 
+## [2026.11.0] - 2026-11-02
+
+### Fixed
+- **Status card showed the wrong kWh for an already-active, locked charge
+  session.** Timo had a session actively running 12:30-16:45 (4h15,
+  `charge_plan_duration_units`), but the card's "⚡ X kWh → NN%" stat read
+  "0.5 kWh" - nowhere near enough for a 4h15 session at the configured
+  charge speed. The "→ NN%" half was already correct (63%, the locked
+  `charge_plan_target_soc`), but the kWh half (`_chargeBlock` in
+  `houseboat-charge-manager-cards.js`) was hardcoded to
+  `planned_charge_kwh_gross`, which is always a FRESH live-preview figure
+  - today's `_plan_window()` result recomputed from the CURRENT live
+  `charge_kwh` every single cycle, with no notion of "a session is
+  already locked and running." By the time Timo looked, SoC had risen
+  enough during the session that a brand new search starting from scratch
+  found only a tiny remaining gap against today's live target - a
+  real number, just the wrong question: the actual locked session,
+  decided earlier from a lower SoC, was still committed to its own
+  larger, already-locked target. Fixed by adding `charge_kwh_remaining`/
+  `charge_kwh_remaining_gross` to `logic.py` - the energy still needed
+  from the LIVE SoC to reach the SAME `locked_target` (`charge_plan_
+  target_soc` -> `pending_plan_target_soc` -> `projected_end_soc`) that
+  `target_soc` already uses - and pointing the status card at it instead,
+  falling back to the old figure for older sensor data. Verified: for
+  Timo's own numbers (SoC 40.1% -> locked target 62.86%, battery 37 kWh,
+  92% charger efficiency) this comes out to 9.15 kWh gross, which lines
+  up with the session's own charge speed x remaining duration
+  (2.17 kW x ~4.25 h =~ 9.2 kWh) - and the full regression suite plus a
+  Playwright card-preview render (now showing "9.2 kWh -> 63%") both
+  confirm it.
+
 ## [2026.10.30] - 2026-10-30
 
 ### Fixed

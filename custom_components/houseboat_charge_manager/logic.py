@@ -1680,16 +1680,41 @@ def compute(
         charge_plan_target_soc = None
     r["charge_plan_target_soc"] = charge_plan_target_soc
 
+    locked_target = (
+        charge_plan_target_soc
+        if charge_plan_target_soc is not None
+        else (pending_plan_target_soc if pending_plan_target_soc is not None else projected_end_soc)
+    )
     if has_no_charge_need or is_idle:
         target_soc = "Idle"
     else:
-        locked_target = (
-            charge_plan_target_soc
-            if charge_plan_target_soc is not None
-            else (pending_plan_target_soc if pending_plan_target_soc is not None else projected_end_soc)
-        )
         target_soc = f"{round(float(locked_target), 1)} %"
     r["target_soc"] = target_soc
+
+    # Remaining energy to the SAME locked_target used for target_soc above -
+    # NOT planned_charge_kwh_gross, which is always a fresh live-preview
+    # figure (today's _plan_window() result from the CURRENT live
+    # charge_kwh, recomputed every cycle regardless of any locked/pending
+    # plan). 2026-11-02: Timo caught the status card showing "0.5 kWh"
+    # for an active, already-locked 4h15 session, because the card was
+    # reading exactly that live-preview number - with the session already
+    # under way, SoC had risen enough that a FRESH search starting now
+    # finds only a tiny remaining gap against today's live target, even
+    # though the actual locked session (decided earlier, from a lower
+    # SoC) is still running toward its own, larger, already-committed
+    # target (charge_plan_target_soc). The card's "-> NN%" half already
+    # read the correctly-tiered target; this gives it a kWh figure on the
+    # same tier instead of a mismatched one. Deliberately NOT the
+    # original at-lock-time total (that only shrinks the displayed
+    # number too, counting work already done as 0) - this is the
+    # "energy still needed to reach the locked target from the LIVE soc
+    # right now", a simple rate x remaining_duration cross-check against
+    # the locked session confirms this lines up correctly.
+    charge_kwh_remaining = max(round((float(locked_target) - soc) / 100 * battery_size, 2), 0.0)
+    r["charge_kwh_remaining"] = charge_kwh_remaining
+    r["charge_kwh_remaining_gross"] = (
+        round(charge_kwh_remaining / charger_efficiency, 2) if charger_efficiency > 0 else charge_kwh_remaining
+    )
 
     # ---------------------------------------------------------------
     # CHARGE TIME REMAINING / COMPLETION

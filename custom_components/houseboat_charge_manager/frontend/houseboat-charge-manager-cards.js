@@ -979,7 +979,16 @@ class HouseboatStatusCard extends HTMLElement {
     const now = Date.now();
     const isCharging = !!attrs.is_charging;
     const minutes = (stopMs - startMs) / 60000;
-    const energy = num(attrs.planned_charge_kwh_gross) || 0;
+    // charge_kwh_remaining_gross (2026-11, logic.py) is on the SAME
+    // locked/pending/live tier as win.targetSoc just below -
+    // planned_charge_kwh_gross on its own is always a fresh live-preview
+    // figure (today's from-scratch search), which during an already-
+    // active session reads as a tiny "remaining gap" against today's
+    // live target instead of the real, still-committed locked target -
+    // Timo caught this as "0.5 kWh" on an active 4h15 session that
+    // actually still needed ~9 kWh. Falls back to the old figure for
+    // older sensor data that doesn't expose the new attribute yet.
+    const energy = attrs.charge_kwh_remaining_gross != null ? Number(attrs.charge_kwh_remaining_gross) : (num(attrs.planned_charge_kwh_gross) || 0);
     let inBar;
     let below;
     if (isCharging) {
