@@ -954,21 +954,36 @@ def compute(
         # ---------------------------------------------------------------
         # SPLIT-SESSION SEARCH (2026.10.11)
         # ---------------------------------------------------------------
-        # Only considered in exactly the branch above that would otherwise
-        # charge the FULL required duration as one contiguous block starting
-        # at cheapest_start_index (price_limited_start_index >= 0, i.e.
-        # charging is justified at all) - not below the SoC floor (that mode
-        # deliberately ignores price nuance, by earlier design choice) and not
-        # combined with price-trimming (a different, incompatible shortening
-        # mechanism). "Always split once it's cheaper" (user's explicit
-        # choice) - the only floor is MIN_SPLIT_BLOCK_UNITS per block, plus a
-        # minimum gap of one full cooldown period so block B is never due
-        # before the reconnect lock-out from block A's stop has actually
-        # cleared (also the user's explicit choice, over an unconditional
-        # 1-unit gap).
+        # Not below the SoC floor (that mode deliberately ignores price
+        # nuance, by earlier design choice). "Always split once it's
+        # cheaper" (user's explicit choice) - the only floor is
+        # MIN_SPLIT_BLOCK_UNITS per block, plus a minimum gap of one full
+        # cooldown period so block B is never due before the reconnect
+        # lock-out from block A's stop has actually cleared (also the
+        # user's explicit choice, over an unconditional 1-unit gap).
+        #
+        # 2026-11-03: this used to also require price_limited_start_index
+        # >= 0 - i.e. only even TRY splitting when some single contiguous
+        # full-duration window already cleared the live price ceiling
+        # somewhere. But a required duration that's a large fraction of
+        # the day can genuinely fail to clear that ceiling as ANY single
+        # contiguous block - every placement is forced to straddle at
+        # least one of the day's price peaks - while still being
+        # perfectly splittable into two separately-placed, shorter blocks
+        # that dodge those peaks entirely and come out cheaper in total.
+        # Timo caught exactly this from his own price chart: a flat,
+        # genuinely cheap stretch narrower than the needed duration, with
+        # the chosen single block spilling into the pricier shoulders on
+        # both sides purely because it was "fairly wide". The old gate
+        # meant the split search was never even attempted in that case -
+        # it fell straight through to the plain cheapest full block.
+        # Splitting is still only ever CHOSEN when it's actually cheaper
+        # than that single block (the cost comparison below is
+        # unchanged), so this only adds cases where it can win, never
+        # forces it.
         split_min_gap_units = max(math.ceil(float(T[NUM_COOLDOWN_MINUTES]) / UNIT_MINUTES), 1)
         split_candidate: Optional[tuple[float, int, int, int, int]] = None
-        if not is_below_soc_floor and price_limited_start_index >= 0:
+        if not is_below_soc_floor:
             split_candidate = _best_two_block_split(
                 interval_price, horizon, duration, MIN_SPLIT_BLOCK_UNITS, split_min_gap_units
             )
@@ -1329,21 +1344,59 @@ def compute(
     if awaiting_split_b:
         is_start_imminent = int(prev_charge_plan_b_start) - interval_start_unit <= 1
         r["is_start_imminent"] = is_start_imminent
-        live_start_unit = int(prev_charge_plan_b_start)
-        pending_plan_start_unit = live_start_unit
-        pending_plan_duration_units = (
-            int(prev_charge_plan_b_duration) if prev_charge_plan_b_duration is not None else None
+
+        # 2026-11-10: this used to NEVER re-evaluate block B's reserved
+        # slot for as long as the pause lasted - "no NEW split can be
+        # considered" meant literally never, however much better an
+        # opportunity turned up later. Timo caught this from his own
+        # price data: block B got reserved for a middling price soon
+        # after block A finished, while a genuinely cheaper stretch
+        # arrived overnight a few hours later that the original search
+        # (made before block A even started) had no way to know about
+        # yet. Mirrors the non-split branch's own reseed logic just
+        # below: only replace the reservation with THIS cycle's fresh
+        # split-search result when one was actually found
+        # (is_split_chosen) and its own block B genuinely beats the
+        # currently reserved slot's own average price - never on a
+        # timing change alone (block B's start isn't "stale" the way a
+        # missed single-block start would be), and never just because a
+        # split still exists at all (most cycles it trivially does, same
+        # slot as before - the price comparison is what actually
+        # matters). Deliberately not reconsidered once imminent - by
+        # then there's no meaningful lead time left to act on a change.
+        locked_b_idx = int(prev_charge_plan_b_start) - interval_start_unit
+        locked_b_duration = int(prev_charge_plan_b_duration) if prev_charge_plan_b_duration is not None else 1
+        if 0 <= locked_b_idx < len(interval_price):
+            locked_b_window = interval_price[locked_b_idx : locked_b_idx + locked_b_duration]
+            locked_b_avg = _avg(locked_b_window) if locked_b_window else 1000.0
+        else:
+            locked_b_avg = 1000.0
+        reseed_b = (
+            (not is_start_imminent)
+            and is_split_chosen
+            and split_b_average_price is not None
+            and split_b_average_price < locked_b_avg
         )
-        pending_plan_average_price = P.get("pending_plan_b_average_price")
-        # No NEW split can be considered while one is already pending
-        # block B's start - just keep tracking the reserved slot itself.
+
+        if reseed_b:
+            live_start_unit = interval_start_unit + split_b_effective_start_index
+            pending_plan_duration_units = split_b_planned_duration_units
+            pending_plan_average_price = split_b_average_price
+            pending_mode = "reseed"
+        else:
+            live_start_unit = int(prev_charge_plan_b_start)
+            pending_plan_duration_units = (
+                int(prev_charge_plan_b_duration) if prev_charge_plan_b_duration is not None else None
+            )
+            pending_plan_average_price = P.get("pending_plan_b_average_price")
+            # Downstream code (pending_plan_target_soc) only distinguishes
+            # "clear" from everything else - "keep" is the accurate label
+            # for "holding an already-decided reservation unchanged".
+            pending_mode = "keep"
+        pending_plan_start_unit = live_start_unit
         pending_plan_b_start_unit = live_start_unit
         pending_plan_b_duration_units = pending_plan_duration_units
         pending_plan_b_average_price = pending_plan_average_price
-        # Downstream code (pending_plan_target_soc) only distinguishes
-        # "clear" from everything else - "keep" is the accurate label for
-        # "holding an already-decided reservation unchanged".
-        pending_mode = "keep"
     else:
         is_start_imminent = (not is_charging) and has_charge_need and (effective_start_index <= 1)
         r["is_start_imminent"] = is_start_imminent
@@ -1503,18 +1556,20 @@ def compute(
     r["charge_plan_end_unit"] = charge_plan_end_unit
 
     # Block B reservation bookkeeping: seeded the moment block A locks in
-    # (if this plan is itself a chosen split), held unchanged through
-    # block A's charging and the pause after it, and consumed - cleared
-    # back to None - the moment block B itself locks in (resuming_split_b
-    # above), at which point block B proceeds as an entirely ordinary
-    # (final) block, including the normal calibration/balance completion
-    # guard on its own end.
+    # (if this plan is itself a chosen split), held through block A's
+    # charging and the pause after it (now re-evaluated each cycle of
+    # that pause instead of frozen verbatim - see PRE-START LOCK's
+    # reseed_b above, whose result these two local variables already
+    # carry), and consumed - cleared back to None - the moment block B
+    # itself locks in (resuming_split_b above), at which point block B
+    # proceeds as an entirely ordinary (final) block, including the
+    # normal calibration/balance completion guard on its own end.
     if resuming_split_b:
         charge_plan_b_start_unit = None
         charge_plan_b_duration_units = None
     elif prev_charge_plan_b_start is not None:
-        charge_plan_b_start_unit = prev_charge_plan_b_start
-        charge_plan_b_duration_units = prev_charge_plan_b_duration
+        charge_plan_b_start_unit = pending_plan_b_start_unit
+        charge_plan_b_duration_units = pending_plan_b_duration_units
     elif is_charging and prev_charge_plan_start is None:
         # Seed block A's own reservation for B, if this lock-in is itself
         # a chosen split. Deliberately read from PERSISTED STORE (last

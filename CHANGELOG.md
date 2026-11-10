@@ -13,6 +13,70 @@ Versions are **year.month.release**, like ESS Manager's own (as of
 the releases in that month from 0 - `2026.10.0`, `2026.10.1`, ...,
 `2026.11.0`.
 
+## [2026.11.2] - 2026-11-10
+
+### Fixed
+- **Block B of an already-reserved split never got re-evaluated for as
+  long as the pause lasted, however much better an opportunity turned up
+  later.** Timo split a session, block A ran and finished, and block B
+  got reserved for a middling evening price - but an hour or two later he
+  noticed a genuinely cheaper stretch arriving overnight that the
+  original search (made before block A even started) had no way to know
+  about yet, and block B just sat there holding its stale, pricier slot.
+  Root cause (`logic.py`, PRE-START LOCK's `awaiting_split_b` branch,
+  2026.10.11): "no NEW split can be considered while one is already
+  pending block B's start" meant literally never, for the whole pause -
+  `pending_plan_b_*` (and, since SESSION LOCK-IN read the raw persisted
+  value directly, the authoritative `charge_plan_b_start_unit`/
+  `duration_units` too) were just copied forward verbatim every cycle,
+  with this cycle's freshly-computed split search thrown away unused.
+  Fixed by comparing the currently reserved block B's own average price
+  against this cycle's fresh split search's block B, and reseeding onto
+  the fresh one when it's genuinely cheaper - mirroring the reseed logic
+  the non-split pending-plan branch already had. Deliberately NOT
+  reseeded once the reservation is imminent (`is_start_imminent`) - by
+  then there's no meaningful lead time left to act on a change - and
+  never on timing or "a split still exists" alone, only on a real price
+  improvement, so a reservation that's already the best available option
+  is left untouched (verified as a genuine fixed point across repeated
+  cycles, not just a one-off check). Verified against Timo's own live
+  data end-to-end through `compute()`: the stale 22:45 reservation
+  (~€0.223 avg) correctly moves to the fresh, cheaper overnight slot the
+  live search finds, a reservation that's already optimal doesn't budge,
+  and an imminent reservation stays put even when a cheaper slot exists
+  elsewhere. Also includes the 2026.11.1 split-search fix below, which
+  hadn't made it into a deployed release yet.
+
+## [2026.11.1] - 2026-11-03
+
+### Fixed
+- **Split-session search was never even attempted when no single
+  contiguous block could clear the live price ceiling.** Timo had a
+  charge window picked that was "not optimal": a required 31-unit
+  (7.75h) session, with a genuinely flat, cheap stretch in the price data
+  that was narrower than 31 units - so the chosen single contiguous block
+  spilled into the pricier shoulders on both sides of it just to reach
+  the required width, exactly as he described ("het vlakke deel...nu
+  gaat hij ook de duurdere delen in omdat hij redelijk breed is"). Root
+  cause (`logic.py`, `_plan_window`): the split-session search
+  (2026.10.11) was gated behind `price_limited_start_index >= 0` - i.e.
+  only tried when some single contiguous full-duration window had
+  already cleared the live price ceiling somewhere. For a session this
+  wide, every possible contiguous placement is forced to straddle at
+  least one of the day's price peaks, so NO placement ever clears the
+  ceiling and `price_limited_start_index` stays `-1` - the split search
+  was never even run, falling straight through to the plain cheapest
+  (but still peak-straddling) single block. Fixed by dropping that
+  precondition (keeping only "not below the SoC floor", unchanged) - the
+  split search now always runs and is chosen exactly when it's cheaper in
+  total than the single block (that comparison itself is unchanged), so
+  this only adds cases where it can win, never forces a split. Verified
+  against Timo's own live price data: for his exact 31-unit need, the
+  single contiguous block cost 7.50 (avg €0.242/kWh) while the two-block
+  split (a 21-unit block in the flat stretch + a separate, later 10-unit
+  block) costs 7.02 (avg €0.227/kWh, ~6% cheaper) - confirmed end-to-end
+  through `compute()`, not just the split search in isolation.
+
 ## [2026.11.0] - 2026-11-02
 
 ### Fixed
