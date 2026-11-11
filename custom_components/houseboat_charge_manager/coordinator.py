@@ -5,8 +5,10 @@ the small subset of the result that must survive a Home Assistant restart
 """
 from __future__ import annotations
 
+import inspect
 import logging
-from datetime import timedelta
+from collections import deque
+from datetime import datetime, timedelta
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
@@ -46,6 +48,75 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+# Home Assistant 2024.11+ wants the config entry passed to
+# DataUpdateCoordinator explicitly (relying on the implicit ContextVar is
+# reported as deprecated, "breaks in 2026.8"). hacs.json still allows
+# 2024.6, where that keyword doesn't exist yet - so only pass it when the
+# running Home Assistant knows it.
+_COORDINATOR_ACCEPTS_CONFIG_ENTRY = "config_entry" in inspect.signature(DataUpdateCoordinator.__init__).parameters
+
+# Diagnostics (diagnostics.py): how many plan/decision changes to keep in
+# memory. One entry is only added when something in _decision_summary()
+# actually changes (not every 15-second cycle), so 500 entries normally
+# covers several days. In-memory only - cleared on a restart/reload.
+DECISION_LOG_MAX_ENTRIES = 500
+
+# Keys from the result dict that describe "what the planner has decided".
+# A change in any of these adds an entry to the decision log. Indices that
+# are relative to "now" (start_index, split_b_start_index, ...) shift every
+# 15 minutes on their own, so those are logged as absolute day-units instead
+# (see _decision_summary) to keep the log free of meaningless churn.
+_DECISION_KEYS: tuple[str, ...] = (
+    "system_status",
+    "charge_action_reason",
+    "is_charging",
+    "has_charge_need",
+    "start_charge_time",
+    "stop_charge_time",
+    "charge_plan_target_soc",
+    "pending_plan_target_soc",
+    "is_full_charge_cycle",
+    "is_calibration_cycle",
+    "charge_plan_start_unit",
+    "charge_plan_duration_units",
+    "charge_plan_b_start_unit",
+    "charge_plan_b_duration_units",
+    "pending_plan_start_unit",
+    "pending_plan_duration_units",
+    "pending_plan_b_start_unit",
+    "pending_plan_b_duration_units",
+    "is_split_chosen",
+    "is_split_active",
+    "is_price_negative",
+    "is_voyage_pending",
+    "is_voyage_charge_forced",
+    "is_vacation_mode",
+    "is_within_cooldown",
+    "is_grid_unavailable",
+)
+# Context logged alongside each entry, but never a reason for a new entry
+# on its own (SoC and price move continuously).
+_DECISION_CONTEXT_KEYS: tuple[str, ...] = (
+    "current_soc",
+    "target_soc",
+    "price_limit",
+    "interval_start_unit",
+)
+
+
+def _decision_summary(result: dict[str, Any]) -> dict[str, Any]:
+    summary = {key: result.get(key) for key in _DECISION_KEYS}
+    base = result.get("interval_start_unit")
+    for rel_key, abs_key in (
+        ("effective_start_index", "effective_start_unit_abs"),
+        ("split_b_effective_start_index", "split_b_start_unit_abs"),
+    ):
+        rel = result.get(rel_key)
+        summary[abs_key] = (base + rel) if isinstance(base, int) and isinstance(rel, (int, float)) else None
+    summary["effective_duration_units"] = result.get("effective_duration_units")
+    summary["split_b_duration_units"] = result.get("split_b_duration_units")
+    return summary
 
 # Entities where "unavailable"/"unknown"/missing must NEVER be silently read
 # as 0 (or False) and fed into the calculation - a sensor dropout is not the
@@ -117,11 +188,13 @@ class HouseboatChargeManagerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Runs the full charge-planning calculation every cycle."""
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+        extra: dict[str, Any] = {"config_entry": entry} if _COORDINATOR_ACCEPTS_CONFIG_ENTRY else {}
         super().__init__(
             hass,
             _LOGGER,
             name=DOMAIN,
             update_interval=timedelta(seconds=UPDATE_INTERVAL_SECONDS),
+            **extra,
         )
         self.entry = entry
         self._store: Store = Store(hass, STORAGE_VERSION, f"{DOMAIN}_{entry.entry_id}{STORAGE_KEY_SUFFIX}")
@@ -137,6 +210,46 @@ class HouseboatChargeManagerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # here so a first-ever refresh (before the switch entity exists
         # yet) still behaves like "on", matching the switch's own default.
         self._auto_trigger_scripts_enabled: bool = DEFAULT_AUTO_TRIGGER_SCRIPTS
+
+        # Diagnostics state (read by diagnostics.py, never by the planner).
+        # last_compute_kwargs/last_compute_prev are the EXACT inputs of the
+        # most recent logic.compute() call, so a downloaded diagnostics file
+        # can be replayed offline and give the identical result.
+        self.last_cycle_at: datetime | None = None
+        self.last_compute_kwargs: dict[str, Any] | None = None
+        self.last_compute_prev: dict[str, Any] | None = None
+        self.last_missing_entities: list[str] = []
+        self.last_compute_error: str | None = None
+        self.decision_log: deque[dict[str, Any]] = deque(maxlen=DECISION_LOG_MAX_ENTRIES)
+        self._last_decision_summary: dict[str, Any] | None = None
+
+    @property
+    def auto_trigger_scripts_enabled(self) -> bool:
+        return self._auto_trigger_scripts_enabled
+
+    @property
+    def number_values(self) -> dict[str, float]:
+        return dict(self._number_values)
+
+    async def async_load_store_raw(self) -> Any:
+        """Raw persisted Store contents, for diagnostics."""
+        return await self._store.async_load()
+
+    def _record_decision(self, now: datetime, result: dict[str, Any]) -> None:
+        summary = _decision_summary(result)
+        if summary == self._last_decision_summary:
+            return
+        previous = self._last_decision_summary or {}
+        changed = sorted(k for k in summary if summary.get(k) != previous.get(k)) if previous else ["(first cycle)"]
+        self._last_decision_summary = summary
+        self.decision_log.append(
+            {
+                "at": now.isoformat(),
+                "changed": changed,
+                **summary,
+                **{key: result.get(key) for key in _DECISION_CONTEXT_KEYS},
+            }
+        )
 
     async def async_load_persisted_state(self) -> None:
         stored = await self._store.async_load()
@@ -219,6 +332,7 @@ class HouseboatChargeManagerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _async_update_data(self) -> dict[str, Any]:
         hass = self.hass
         now = dt_util.now()
+        self.last_cycle_at = now
 
         missing: list[str] = []
         for conf_key, label in _CRITICAL_ENTITY_KEYS:
@@ -226,6 +340,7 @@ class HouseboatChargeManagerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             state = hass.states.get(entity_id) if entity_id else None
             if state is None or state.state in ("unavailable", "unknown", ""):
                 missing.append(f"{label} ({entity_id or 'not configured'})")
+        self.last_missing_entities = missing
         if missing:
             raise UpdateFailed(
                 "Waiting for sensor data - unavailable, unknown or not configured: " + "; ".join(missing)
@@ -251,30 +366,36 @@ class HouseboatChargeManagerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         is_force_full_charge = _state_bool(hass, self._conf(CONF_FORCE_FULL_CHARGE_ENTITY))
         is_grid_unavailable = _state_unavailable(hass, self._conf(CONF_GRID_SWITCH_ENTITY))
 
+        compute_kwargs: dict[str, Any] = {
+            "now": now,
+            "soc": soc,
+            "voltage": voltage,
+            "cell_max_v": cell_max_v,
+            "cell_min_v": cell_min_v,
+            "price_today": price_today,
+            "price_tomorrow": price_tomorrow,
+            "price_current": price_current,
+            "price_14d_average": price_14d_average,
+            "shore_power_w": shore_power_w,
+            "avg_load_w": avg_load_w,
+            "walstroom_requested_amps": walstroom_requested_amps,
+            "start_voyage_hours_raw": start_voyage_hours_raw,
+            "low_battery_percentage": low_battery_percentage,
+            "is_vacation_mode": is_vacation_mode,
+            "is_force_full_charge": is_force_full_charge,
+            "is_grid_unavailable": is_grid_unavailable,
+            "tunables": dict(self._number_values),
+        }
+        self.last_compute_kwargs = compute_kwargs
+        self.last_compute_prev = self._prev
+
         try:
-            result = logic.compute(
-                now=now,
-                soc=soc,
-                voltage=voltage,
-                cell_max_v=cell_max_v,
-                cell_min_v=cell_min_v,
-                price_today=price_today,
-                price_tomorrow=price_tomorrow,
-                price_current=price_current,
-                price_14d_average=price_14d_average,
-                shore_power_w=shore_power_w,
-                avg_load_w=avg_load_w,
-                walstroom_requested_amps=walstroom_requested_amps,
-                start_voyage_hours_raw=start_voyage_hours_raw,
-                low_battery_percentage=low_battery_percentage,
-                is_vacation_mode=is_vacation_mode,
-                is_force_full_charge=is_force_full_charge,
-                is_grid_unavailable=is_grid_unavailable,
-                tunables=self._number_values,
-                prev=self._prev,
-            )
+            result = logic.compute(**compute_kwargs, prev=self._prev)
         except Exception as err:  # noqa: BLE001 - never let a bad cycle crash the coordinator
+            self.last_compute_error = repr(err)
+            _LOGGER.exception("Houseboat Charge Manager: logic.compute() raised")
             raise UpdateFailed(f"Houseboat Charge Manager calculation failed: {err}") from err
+        self.last_compute_error = None
 
         if result.get("should_reset_vacation_departure_target_days"):
             await self._async_reset_number_to_default(
@@ -283,6 +404,7 @@ class HouseboatChargeManagerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         await self._async_handle_charge_action(result)
 
+        self._record_decision(now, result)
         self._prev = result
         await self._store.async_save(logic.serialize_prev(result))
         return result

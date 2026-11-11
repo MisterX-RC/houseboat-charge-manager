@@ -90,6 +90,18 @@ up - no manual resource step. Add a card with `type: custom:houseboat-
 price-card` or `custom:houseboat-status-card` and `entity:` pointed at the
 new status sensor (e.g. `sensor.houseboat_charge_manager_status`).
 
+## Troubleshooting: diagnostics file
+
+Settings -> Devices & services -> **Houseboat Charge Manager** -> three-dot
+menu -> **Download diagnostics**. The JSON file contains the configuration,
+all tunables, the live state of every source sensor (including the full
+price lists), the complete result of the latest planning cycle, the exact
+inputs of that cycle (so it can be replayed offline and give the identical
+result), and a timeline of recent plan changes since the last restart.
+Share this file when reporting a problem - it shows far more than the
+sensor attributes do. It contains no passwords or tokens, only entity ids,
+sensor values and prices.
+
 ## What changed vs. a literal line-for-line port
 
 Home Assistant's trigger-based template sensors have a quirk: every

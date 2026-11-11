@@ -13,6 +13,72 @@ Versions are **year.month.release**, like ESS Manager's own (as of
 the releases in that month from 0 - `2026.10.0`, `2026.10.1`, ...,
 `2026.11.0`.
 
+## [2026.11.3] - 2026-11-11
+
+### Added
+- **Home Assistant "Download diagnostics" support (`diagnostics.py`).**
+  Timo: "Op dit moment kan ik alleen een sensor met zijn attributes delen,
+  maar dit geeft nooit het complete beeld van wat de integratie doet.
+  Gebruik de Diagnose mogenlijkheid van home assistant zodat we vanuit de
+  integratie een diagnose bestand kunnen downloaden die ik hier weer kan
+  delen voor troubleshooting." Settings -> Devices & services -> Houseboat
+  Charge Manager -> three-dot menu -> *Download diagnostics* now produces
+  one JSON file with:
+  - `meta` - integration/HA version, time zone, coordinator health (last
+    successful update, last error, which source sensors were missing in
+    the last cycle, auto-trigger switch state);
+  - `config` - the setup-wizard/options entity choices;
+  - `tunables` - every number tunable, current value next to its default;
+  - `source_entities` - live state + attributes of every configured
+    source entity, including the price entity's full `today`/`tomorrow`
+    lists, exactly as Home Assistant saw them;
+  - `integration_entities` - every entity this integration created, with
+    its state and whether it is disabled;
+  - `last_result` - the complete result dict of the latest cycle (all
+    ~150 derived values, also the ones no sensor shows);
+  - `replay` - the **exact** `logic.compute()` inputs of that same cycle,
+    including the full previous-cycle state (`prev`, not just the
+    persisted subset). Feeding them back into `compute()` offline
+    reproduces `last_result` 1-on-1, so a reported situation can be put
+    straight into a simulation script instead of reconstructed by hand
+    from screenshots. If `compute()` itself raised, `compute_error` says
+    so and these are the inputs of the failing cycle;
+  - `persisted_store` - what is saved to disk across restarts;
+  - `decision_log` - an in-memory timeline (since the last restart/reload,
+    max. 500 entries) of every cycle in which the plan or a decision
+    changed: status, start/stop time, charge/pending plan A and B, split,
+    locked target SoC, forced-charge triggers - each entry listing which
+    fields changed, with SoC/price limit as context. Relative indices are
+    logged as absolute day-units so the log doesn't churn every 15 minutes
+    on its own.
+  The file is also produced when setup failed or is being retried (then
+  with config, tunables and source entity states only - usually exactly
+  what's needed to spot the unavailable sensor).
+
+### Changed
+- `coordinator.py` now passes its config entry to `DataUpdateCoordinator`
+  explicitly when the running Home Assistant supports it (2024.11+). Found
+  while testing the above against a real Home Assistant core: relying on
+  the implicit context variable is reported as deprecated, "breaks in HA
+  2026.8". Older versions (`hacs.json` still allows 2024.6) keep the old
+  call, so nothing changes there. `compute()` exceptions are now also
+  logged with a full traceback instead of only the one-line
+  `UpdateFailed` message.
+
+### Verification
+- Integration test against a real Home Assistant core (2026.2.3, entity
+  registry loaded, real `DataUpdateCoordinator`): 40 quarter-hour cycles,
+  then diagnostics generated. The file passes both Home Assistant's own
+  JSON encoder and strict `json.dumps(allow_nan=False)`; replaying its
+  `replay` section through `logic.compute()` gives a result identical to
+  `last_result` on all 151 keys; the decision log starts with
+  `(first cycle)` and only adds entries on real plan changes (11 over 40
+  cycles). With the SoC sensor set to `unavailable` the next file shows
+  `last_update_success: false` and names the missing sensor; with the
+  coordinator not loaded it still produces config/tunables/source
+  entities plus an explanatory note. Smoke scenario (`logic.py`
+  unchanged) still passes.
+
 ## [2026.11.2] - 2026-11-10
 
 ### Fixed
