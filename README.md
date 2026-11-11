@@ -1,3 +1,5 @@
+<p align="center"><img src="custom_components/houseboat_charge_manager/brand/icon.png" width="128" alt="Houseboat Charge Manager logo: a klipperaak sailing barge against a sunset"></p>
+
 # Houseboat Charge Manager
 
 A Home Assistant custom integration that plans shore-power charging for a
@@ -89,6 +91,15 @@ auto-registered as a Lovelace resource the moment the integration is set
 up - no manual resource step. Add a card with `type: custom:houseboat-
 price-card` or `custom:houseboat-status-card` and `entity:` pointed at the
 new status sensor (e.g. `sensor.houseboat_charge_manager_status`).
+
+## Logo
+
+The integration ships its own logo in
+`custom_components/houseboat_charge_manager/brand/` (`icon.png` 256 px,
+`icon@2x.png` 512 px). Home Assistant 2026.3 and newer shows it
+automatically on the integration's tile and pages - no submission to the
+separate brands repository needed. Older versions just show the generic
+placeholder. The editable source is `docs/brand/icon.svg`.
 
 ## Troubleshooting: diagnostics file
 

@@ -13,6 +13,36 @@ Versions are **year.month.release**, like ESS Manager's own (as of
 the releases in that month from 0 - `2026.10.0`, `2026.10.1`, ...,
 `2026.11.0`.
 
+## [2026.11.4] - 2026-11-11
+
+### Added
+- **Integration logo.** Timo: "Maak een leuk logo voor de integratie zodat
+  ik die zie in Home assistant. Het schip is een klipperaak." Four
+  directions were proposed (app icon, battery, sunset badge, single-colour
+  glyph); Timo picked the sunset badge and then shared a side-view photo
+  of the actual ship, so it was redrawn after it: a long, low hull with an
+  almost straight sheer and a rounded stern, the raised aft cabin (roef)
+  with lit windows, the mast just forward of midships, a mainsail with a
+  short curved gaff and a long boom running out over the roef ("De giek
+  van het zeil mag iets langer, het grootzeil is nu erg klein. De gaffel
+  is wel goed."), staysail and jib on a long bowsprit, and the leeboard
+  hoisted just aft of the mast with its broad end aft - silhouetted against
+  a setting sun, with a lightning bolt cut out of the mainsail.
+  Shipped as `brand/icon.png` (256 px) and `brand/icon@2x.png` (512 px)
+  inside the integration folder: since Home Assistant 2026.3 custom
+  integrations can carry their own brand images there and HA shows them
+  automatically, no PR to `home-assistant/brands` needed. Both are trimmed
+  to the badge's edge, transparent outside the circle, non-interlaced. The
+  badge has its own dark rim, so one version works in both light and dark
+  mode (no `dark_icon.png` needed). Editable source: `docs/brand/icon.svg`
+  (kept outside `brand/`, which only accepts the fixed image filenames).
+  The README now shows the logo at the top.
+
+### Verification
+- Rendered at 256/512 px and checked at 48 and 32 px (still clearly a
+  sailing barge with a bolt). No Python or JavaScript changed; all `.py`
+  files still compile and the cards pass `node --check`.
+
 ## [2026.11.3] - 2026-11-11
 
 ### Added

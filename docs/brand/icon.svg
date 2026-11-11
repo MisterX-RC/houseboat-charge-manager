@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="8 8 240 240" width="256" height="256">
+<defs><linearGradient id="skyC2" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ff7e5f"/><stop offset=".55" stop-color="#feb47b"/><stop offset="1" stop-color="#ffd89b"/></linearGradient>
+<clipPath id="cC2"><circle cx="128" cy="128" r="116"/></clipPath></defs>
+<circle cx="128" cy="128" r="120" fill="#1e2a38"/>
+<g clip-path="url(#cC2)">
+<rect width="256" height="256" fill="url(#skyC2)"/>
+<circle cx="104" cy="150" r="56" fill="#fff4d6" opacity=".9"/>
+<rect y="182" width="256" height="80" fill="#2a4a6b"/>
+<path d="M0,198 q14,-7 28,0 t28,0 t28,0 t28,0 t28,0 t28,0 t28,0 t28,0 t28,0 t28,0" stroke="#ffd89b" stroke-width="3" fill="none" stroke-linecap="round" opacity="0.8"/><path d="M0,214 q14,-7 28,0 t28,0 t28,0 t28,0 t28,0 t28,0 t28,0 t28,0 t28,0 t28,0" stroke="#ffb37b" stroke-width="3" fill="none" stroke-linecap="round" opacity="0.6"/><path d="M0,230 q14,-7 28,0 t28,0 t28,0 t28,0 t28,0 t28,0 t28,0 t28,0 t28,0 t28,0" stroke="#ff9a6b" stroke-width="3" fill="none" stroke-linecap="round" opacity="0.4"/>
+
+<!-- kluiverboom -->
+<path d="M206,160 L246,152" stroke="#1e2a38" stroke-width="4" stroke-linecap="round"/>
+<!-- mast + wimpel -->
+<path d="M140,168 L140,22" stroke="#1e2a38" stroke-width="5" stroke-linecap="round"/>
+<path d="M141,22 L166,28 L141,34 Z" fill="#ffd23f"/>
+<!-- kluiver (naar het eind van de kluiverboom) -->
+<path d="M145,30 L244,152 L190,154 Q192,96 145,30 Z" fill="#2c3e50"/>
+<!-- fok (naar de boeg), met lichte rand zodat beide voorzeilen los te zien zijn -->
+<path d="M144,44 L208,160 L152,160 Q158,104 144,44 Z" fill="#1e2a38" stroke="#feb47b" stroke-width="2" stroke-linejoin="round"/>
+<!-- grootzeil: smal, korte gebogen gaffel, bliksem uitgespaard -->
+<mask id="mC2"><rect x="0" y="0" width="256" height="256" fill="white"/><path d="M112,62 L92,100 L106,100 L96,132 L124,92 L109,92 L118,62 Z" fill="black"/></mask>
+<path d="M134,144 L134,62 Q116,50 96,44 Q76,98 38,142 Z" fill="#1e2a38" mask="url(#mC2)"/>
+<path d="M136,64 Q116,50 94,43" stroke="#1e2a38" stroke-width="4" fill="none" stroke-linecap="round"/>
+<path d="M136,144 L34,142" stroke="#1e2a38" stroke-width="4" stroke-linecap="round"/>
+<!-- roef achterin met verlichte ramen -->
+<path d="M32,168 L32,152 Q32,148 36,148 L78,148 Q82,148 82,152 L82,170 Z" fill="#1e2a38"/>
+<rect x="40" y="154" width="8" height="6" rx="1.5" fill="#ffd23f"/>
+<rect x="53" y="154" width="8" height="6" rx="1.5" fill="#ffd23f"/>
+<rect x="66" y="154" width="8" height="6" rx="1.5" fill="#ffd23f"/>
+<!-- romp: lang en laag, bijna rechte zeeg, rond achterschip -->
+<path d="M24,166 Q120,174 214,158 C212,170 206,180 198,188 L46,188 C34,184 26,176 24,166 Z" fill="#1e2a38"/>
+<path d="M28,170 Q120,177 210,162" stroke="#feb47b" stroke-width="1.6" fill="none" opacity=".7"/>
+<!-- roer -->
+<path d="M26,168 L16,170 Q14,182 28,188 Z" fill="#1e2a38"/>
+<!-- zijzwaard: net achter de mast, opgehaald, breed eind naar achteren -->
+<path d="M138,166 L136,176 Q114,190 94,184 Q86,176 96,170 Q116,166 138,166 Z" fill="#1e2a38" stroke="#feb47b" stroke-width="2" stroke-linejoin="round"/>
+
+</g>
+<circle cx="128" cy="128" r="116" fill="none" stroke="#1e2a38" stroke-width="8"/>
+</svg>
