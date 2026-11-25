@@ -212,7 +212,7 @@ function chargeWindow(attrs) {
     : Number(attrs.planned_charge_time_units) || 0;
   const windowPrice = attrs.pending_plan_average_price != null ? Number(attrs.pending_plan_average_price) : (Number(attrs.charge_window_average_price) || 0);
   const priceLimit = attrs.charge_plan_price_limit != null ? Number(attrs.charge_plan_price_limit) : (Number(attrs.price_limit_at_window_start) || 0);
-  const favorable = windowPrice <= priceLimit || !!attrs.is_soc_critical_at_window_start;
+  const favorable = windowPrice <= priceLimit || !!attrs.is_soc_critical_at_window_start || !!attrs.is_deadline_gate_override;
   const targetSoc = attrs.charge_plan_target_soc != null ? Number(attrs.charge_plan_target_soc)
     : attrs.pending_plan_target_soc != null ? Number(attrs.pending_plan_target_soc)
     : num(attrs.projected_end_soc);

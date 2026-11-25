@@ -13,6 +13,84 @@ Versions are **year.month.release**, like ESS Manager's own (as of
 the releases in that month from 0 - `2026.10.0`, `2026.10.1`, ...,
 `2026.11.0`.
 
+## [2026.11.5] - 2026-11-25
+
+### Fixed
+- **Charge plan slid forward all night and finally started on the morning
+  price peak.** Timo, sharing a diagnostics dump from 25-11 08:02: "Ik vind
+  de gekozen prijzen niet logisch kan je dat verklaren?" The charger had
+  been running since 07:58 on a locked 08:00-14:45 window that opens with
+  the morning peak (08:00-10:00 averaging EUR 0.255), while the whole
+  cheaper night (02:00-06:00 ~ EUR 0.199) had passed without charging.
+  The decision log showed why: from 22:15 the reserved plan always read
+  "start next quarter" - every 15 minutes the start moved one quarter
+  further (22:30 -> 23:00 -> ... -> 05:00 -> 08:00), status "Standby", never
+  started - until SoC crossed `soc_critical_percent` (40 %) at 07:58 and the
+  critical override started whatever the slid plan happened to be by then.
+  Root cause - two parts of the logic disagreeing:
+  1. The placement search picks the cheapest placement even when no
+     placement clears the SoC-dependent price ceiling (deliberately, for
+     splits, since 2026-11-03). With a calibration cycle's long need
+     (~47 units, 11.75 h) that placement's block A sat at index 0 - "now" -
+     every cycle.
+  2. The start gate (`is_price_favorable`) only accepts a window priced at
+     or below that ceiling, and the ceiling never anticipates the battery
+     going critical: its SoC projection is clamped at `soc_floor_percent`,
+     so the allowed price tops out at the 14-day average. The night blocks
+     missed it by EUR 0.001-0.02, every cycle.
+  So the plan was rejected, re-derived one quarter later, rejected again -
+  and the only way out was the critical override, at peak prices. (The
+  same clamp also kept `is_soc_critical_at_window_start` false, which is
+  why the dashboard said "Standby" instead of "Wait for start".)
+
+  Fix - a **critical-SoC deadline**: `units_to_soc_critical` (new
+  attribute) is how many units until a no-charging drain at the 24 h
+  average load takes the live SoC below `soc_critical_percent`. When that
+  moment lies within the known prices and the normally chosen placement
+  either wouldn't pass the start gate or would only start after it, the
+  planner instead takes the cheapest placement whose (first) block starts
+  no later than that deadline - single block or split, compared on total
+  cost exactly like the normal search. That plan is flagged
+  `is_critical_deadline_plan`; the flag travels with the reservation
+  (`pending_plan_is_critical_deadline`, and for a split's block B
+  `charge_plan_b_is_critical_deadline`, both restart-persisted) and the
+  start gate accepts it (`is_deadline_gate_override`). Result: a real,
+  fixed plan ("Wait for start", start time stays put) instead of a sliding
+  one. A placement that already passes the gate before the deadline is
+  untouched, and nothing changes when the deadline lies beyond the known
+  prices (then there's still time to wait for tomorrow's publication).
+  Already below `soc_critical_percent`, the existing below-floor/critical
+  handling applies unchanged. The price card colours a deadline plan as
+  favorable too.
+- **A split's block B reservation was dropped while block A was
+  charging (since 2026.11.2).** 2026.11.2's block-B reseed made the
+  reservation follow PRE-START LOCK's `pending_plan_b_*` every cycle - right
+  during the pause, but while block A charges that branch clears
+  `pending_plan_b_*` to None, so on block A's second charging cycle the
+  reservation vanished: `is_split_active` went false, block A stopped on
+  `duration_elapsed` instead of `split_pause`, and no split ever got its
+  second half. Now held verbatim while block A charges; the reseed during
+  the pause is unchanged. Found while verifying the deadline split above.
+
+### Verification
+- Diagnostics replay of Timo's dump: identical to `last_result` apart from
+  the three new attributes.
+- `sim_night.py` / `sim_deadline.py` rebuild that night from the dump
+  (same prices, tunables and load, minute-by-minute from 01:45, SoC 45 %):
+  old logic slides every quarter and only starts on `soc_critical`; new
+  logic starts at 01:45 on `planned_window`, block A stops on
+  `split_pause`, block B starts after the cooldown, SoC never below 45 %,
+  average price paid EUR 0.198 vs 0.204. With the first two night hours
+  made artificially expensive, the plan's start time stays fixed across
+  every cycle and the status reads "Wait for start" until it starts.
+  Situations where the deadline lies beyond the known prices (SoC 80/90 %
+  at 01:45, 09:00, 13:30) give results identical to 2026.11.4.
+  Fixed-point and serialize/deserialize round-trip of a waiting deadline
+  plan are stable; block B is retained across a block-A charging cycle.
+- `sim_smoke.py`, the 2026-11-12 sample replay and the real-Home-Assistant
+  diagnostics test (`test_diagnostics.py`) all pass. All `.py` compile,
+  cards pass `node --check`.
+
 ## [2026.11.4] - 2026-11-11
 
 ### Added

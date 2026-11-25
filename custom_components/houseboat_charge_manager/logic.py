@@ -127,6 +127,7 @@ PERSISTED_KEYS = (
     "pending_plan_b_reference_date",
     "pending_plan_b_duration_units",
     "pending_plan_b_average_price",
+    "pending_plan_is_critical_deadline",
     "charge_plan_start_unit",
     "charge_plan_reference_date",
     "charge_plan_duration_units",
@@ -136,6 +137,7 @@ PERSISTED_KEYS = (
     "charge_plan_b_start_unit",
     "charge_plan_b_reference_date",
     "charge_plan_b_duration_units",
+    "charge_plan_b_is_critical_deadline",
     "is_planned_charge_start",
     "charge_session_ended_at",
     "is_charging",
@@ -297,6 +299,7 @@ def _best_two_block_split(
     total_duration: int,
     min_block_units: int,
     min_gap_units: int,
+    max_first_start: Optional[int] = None,
 ) -> Optional[tuple[float, int, int, int, int]]:
     """Find the cheapest way to deliver `total_duration` units of charging
     as two separated, non-overlapping full-length blocks within
@@ -316,6 +319,11 @@ def _best_two_block_split(
     and the single-block alternative it's compared against cover the same
     total number of units, so summing is equivalent to averaging and
     simpler to combine across two blocks.
+
+    `max_first_start` (2026.11.5), when given, caps block A's start index
+    (block B is unconstrained) - used by the critical-SoC deadline search,
+    which needs block A to begin before the battery would cross
+    soc_critical_percent.
     """
     if total_duration < 2 * min_block_units or horizon < total_duration + min_gap_units:
         return None
@@ -350,6 +358,8 @@ def _best_two_block_split(
                 suffix_min_idx[s2] = suffix_min_idx[s2 + 1]
 
         max_s1 = horizon - l1
+        if max_first_start is not None:
+            max_s1 = min(max_s1, max_first_start)
         for s1 in range(max_s1 + 1):
             s2_floor = s1 + l1 + min_gap_units
             if s2_floor > max_s2:
@@ -850,6 +860,32 @@ def compute(
     soc_ceiling = float(T[NUM_SOC_CEILING_PERCENT])
     drain_per_unit = battery_drain_rate_percent_per_hour / 4
 
+    # ---------------------------------------------------------------
+    # CRITICAL-SoC DEADLINE (2026.11.5)
+    # ---------------------------------------------------------------
+    # How many units from now (interval-relative, same frame as
+    # start_index) until a plain no-charging drain at avg_load carries the
+    # live SoC below soc_critical_percent. None when already below it (the
+    # existing below-floor/critical handling owns that case unchanged) or
+    # when there's no measurable drain. Recomputed from the LIVE SoC every
+    # cycle, so a faster-than-modelled drain simply pulls the deadline
+    # (and any deadline plan built on it) earlier on the next cycle.
+    # See _plan_window's deadline block for why this exists.
+    soc_critical = float(T[NUM_SOC_CRITICAL_PERCENT])
+    if soc >= soc_critical and drain_per_unit > 0:
+        units_to_soc_critical: Optional[int] = math.floor((soc - soc_critical) / drain_per_unit)
+    else:
+        units_to_soc_critical = None
+    r["units_to_soc_critical"] = units_to_soc_critical
+    # Mirrors soc_at_window_start/price_limit_at_window_start further down
+    # (same floor clamp), i.e. exactly the ceiling is_price_favorable will
+    # later judge a window starting at `idx` against.
+    gate_soc_floor_clamp = soc_floor if soc >= soc_floor else 0.0
+
+    def _gate_ceiling_at(idx: int) -> float:
+        projected = max(soc - drain_per_unit * idx, gate_soc_floor_clamp)
+        return price_14d_average * max(1 - ((projected - soc_floor) / (soc_ceiling - soc_floor)), 0)
+
     # -----------------------------------------------------------------
     # CHEAPEST WINDOW SEARCH / SPLIT-SESSION SEARCH / FLAT-BLOCK EXTENSION
     # -----------------------------------------------------------------
@@ -1027,6 +1063,73 @@ def compute(
                 plan_charge_time_units if (is_below_soc_floor or price_limited_start_index >= 0) else price_trim_duration_units
             )
         r["effective_duration_units"] = effective_duration_units
+
+        # ---------------------------------------------------------------
+        # CRITICAL-SoC DEADLINE SEARCH (2026.11.5)
+        # ---------------------------------------------------------------
+        # The search above picks the cheapest placement even when it
+        # doesn't clear the SoC-dependent price ceiling (deliberately, for
+        # splits, since 2026-11-03) - but is_price_favorable then refuses
+        # to start it. When that placement sits right at "now" (index 0, as
+        # a long calibration need easily forces), the result was a plan
+        # that slid one unit forward every 15 minutes: always "starting
+        # next quarter", never favorable, never started. Timo caught this
+        # on 2026-11-25 from a diagnostics dump: the whole cheap night
+        # (02:00-06:00 ~ EUR 0.199) was skipped because each candidate sat
+        # EUR 0.001-0.02 above the ceiling, then at 07:58 SoC crossed
+        # soc_critical_percent and the critical override started whatever
+        # the slid plan was by then - straight into the morning peak
+        # (08:00-10:00 ~ EUR 0.255). "Ik vind de gekozen prijzen niet
+        # logisch."
+        #
+        # Fix: if the battery would cross soc_critical_percent within the
+        # known price horizon, and the placement chosen above either
+        # wouldn't pass the start gate or would only start AFTER that
+        # moment, switch to the cheapest placement whose (first) block
+        # starts no later than that deadline - single block or split,
+        # compared on total cost exactly like above. Such a plan is flagged
+        # is_critical_deadline_plan; the start gate (is_price_favorable)
+        # accepts it, so it's a real, stable plan ("Wait for start", start
+        # time fixed) instead of a sliding one. A placement that already
+        # passes the gate before the deadline is left untouched, and so is
+        # everything when the deadline lies beyond the known prices (then
+        # there's still time to wait for tomorrow's publication).
+        is_critical_deadline_plan = False
+        if units_to_soc_critical is not None and units_to_soc_critical < horizon:
+            deadline = units_to_soc_critical
+            chosen_window = interval_price[start_index : start_index + max(effective_duration_units, 1)]
+            chosen_passes_gate = bool(chosen_window) and _avg(chosen_window) <= _gate_ceiling_at(start_index)
+            if (not chosen_passes_gate) or start_index > deadline:
+                best_single: Optional[tuple[float, int]] = None
+                for idx in range(min(deadline, horizon - 1) + 1):
+                    window = interval_price[idx : idx + duration]
+                    if len(window) < duration:
+                        continue
+                    cost = sum(window)
+                    if best_single is None or cost < best_single[0]:
+                        best_single = (cost, idx)
+                deadline_split = None
+                if not is_below_soc_floor:
+                    deadline_split = _best_two_block_split(
+                        interval_price, horizon, duration, MIN_SPLIT_BLOCK_UNITS, split_min_gap_units,
+                        max_first_start=deadline,
+                    )
+                if deadline_split is not None and (best_single is None or deadline_split[0] < best_single[0] - 1e-6):
+                    split_candidate = deadline_split
+                    is_split_chosen = True
+                    start_index = deadline_split[1]
+                    effective_duration_units = deadline_split[2]
+                    is_critical_deadline_plan = True
+                elif best_single is not None:
+                    is_split_chosen = False
+                    start_index = best_single[1]
+                    effective_duration_units = duration
+                    is_critical_deadline_plan = True
+                if is_critical_deadline_plan:
+                    r["is_split_chosen"] = is_split_chosen
+                    r["start_index"] = start_index
+                    r["effective_duration_units"] = effective_duration_units
+        r["is_critical_deadline_plan"] = is_critical_deadline_plan
         r["low_price"] = min(all_price) if all_price else 0.0
 
         # Block B of a chosen split - interval-relative (same frame as
@@ -1248,6 +1351,7 @@ def compute(
             "effective_start_index": effective_start_index,
             "planned_charge_time_units": planned_charge_time_units,
             "planned_charge_kwh": planned_charge_kwh,
+            "is_critical_deadline_plan": is_critical_deadline_plan,
         }
 
     # -----------------------------------------------------------------
@@ -1318,6 +1422,7 @@ def compute(
     effective_start_index = plan["effective_start_index"]
     planned_charge_time_units = plan["planned_charge_time_units"]
     planned_charge_kwh = plan["planned_charge_kwh"]
+    is_critical_deadline_plan = plan["is_critical_deadline_plan"]
     r["best_interval_price"] = interval_price[effective_start_index : effective_start_index + planned_charge_time_units]
 
     # ---------------------------------------------------------------
@@ -1397,6 +1502,10 @@ def compute(
         pending_plan_b_start_unit = live_start_unit
         pending_plan_b_duration_units = pending_plan_duration_units
         pending_plan_b_average_price = pending_plan_average_price
+        # Block B inherits block A's deadline status (2026.11.5): a split
+        # chosen by the critical-SoC deadline search must be able to finish
+        # its second half too, not stall on the price gate after the pause.
+        pending_plan_is_critical_deadline = bool(P.get("charge_plan_b_is_critical_deadline", False))
     else:
         is_start_imminent = (not is_charging) and has_charge_need and (effective_start_index <= 1)
         r["is_start_imminent"] = is_start_imminent
@@ -1426,16 +1535,22 @@ def compute(
             pending_mode = "seed"
         elif qualifies and (live_start_unit > prev_pending_start or charge_window_average_price < locked_avg):
             pending_mode = "reseed"
+        elif is_critical_deadline_plan and not P.get("pending_plan_is_critical_deadline"):
+            # 2026.11.5: an already-reserved ordinary plan the start gate
+            # won't accept must yield to a critical-SoC deadline plan.
+            pending_mode = "reseed"
         else:
             pending_mode = "keep"
 
         if pending_mode == "clear":
             pending_plan_start_unit = pending_plan_duration_units = pending_plan_average_price = None
             pending_plan_b_start_unit = pending_plan_b_duration_units = pending_plan_b_average_price = None
+            pending_plan_is_critical_deadline = None
         elif pending_mode in ("seed", "reseed"):
             pending_plan_start_unit = live_start_unit
             pending_plan_duration_units = planned_charge_time_units
             pending_plan_average_price = charge_window_average_price
+            pending_plan_is_critical_deadline = is_critical_deadline_plan
             if is_split_chosen:
                 # Reserve block B's EXTENDED window (2026.10.13), not its
                 # raw search position - split_b_effective_start_index/
@@ -1450,6 +1565,7 @@ def compute(
             pending_plan_start_unit = prev_pending_start
             pending_plan_duration_units = P.get("pending_plan_duration_units")
             pending_plan_average_price = P.get("pending_plan_average_price")
+            pending_plan_is_critical_deadline = bool(P.get("pending_plan_is_critical_deadline", False))
             prev_pending_b_start_raw = P.get("pending_plan_b_start_unit")
             pending_plan_b_start_unit = _rebase_unit(
                 prev_pending_b_start_raw if _is_plain_number(prev_pending_b_start_raw) else None,
@@ -1474,6 +1590,7 @@ def compute(
     r["pending_plan_b_reference_date"] = now.date().isoformat() if pending_plan_b_start_unit is not None else None
     r["pending_plan_b_duration_units"] = pending_plan_b_duration_units
     r["pending_plan_b_average_price"] = pending_plan_b_average_price
+    r["pending_plan_is_critical_deadline"] = pending_plan_is_critical_deadline if pending_plan_start_unit is not None else None
 
     # ---------------------------------------------------------------
     # SESSION LOCK-IN
@@ -1567,9 +1684,22 @@ def compute(
     if resuming_split_b:
         charge_plan_b_start_unit = None
         charge_plan_b_duration_units = None
-    elif prev_charge_plan_b_start is not None:
+    elif prev_charge_plan_b_start is not None and awaiting_split_b:
         charge_plan_b_start_unit = pending_plan_b_start_unit
         charge_plan_b_duration_units = pending_plan_b_duration_units
+    elif prev_charge_plan_b_start is not None:
+        # 2026.11.5: block A is still CHARGING - hold the reservation
+        # verbatim. 2026.11.2 switched the line above from "hold prev" to
+        # "take PRE-START LOCK's (possibly reseeded) pending_plan_b_*", which
+        # is right during the pause (awaiting_split_b fills those), but
+        # while block A charges PRE-START LOCK runs its other branch, whose
+        # pending_mode == "clear" wipes pending_plan_b_* to None - so the
+        # reservation was silently dropped on block A's 2nd charging cycle
+        # and no split ever got its second half (block A then stopped on
+        # duration_elapsed instead of split_pause). Found while verifying
+        # the critical-SoC deadline split on Timo's 2026-11-25 dump.
+        charge_plan_b_start_unit = prev_charge_plan_b_start
+        charge_plan_b_duration_units = prev_charge_plan_b_duration
     elif is_charging and prev_charge_plan_start is None:
         # Seed block A's own reservation for B, if this lock-in is itself
         # a chosen split. Deliberately read from PERSISTED STORE (last
@@ -1591,6 +1721,16 @@ def compute(
     else:
         charge_plan_b_start_unit = None
         charge_plan_b_duration_units = None
+    # 2026.11.5: whether the outstanding block-B reservation came from a
+    # critical-SoC deadline plan - seeded from block A's pending flag at
+    # lock-in, held through the pause, gone with the reservation itself.
+    if charge_plan_b_start_unit is None:
+        charge_plan_b_is_critical_deadline = None
+    elif prev_charge_plan_b_start is not None:
+        charge_plan_b_is_critical_deadline = bool(P.get("charge_plan_b_is_critical_deadline", False))
+    else:
+        charge_plan_b_is_critical_deadline = bool(P.get("pending_plan_is_critical_deadline", False))
+    r["charge_plan_b_is_critical_deadline"] = charge_plan_b_is_critical_deadline
     r["charge_plan_b_start_unit"] = charge_plan_b_start_unit
     r["charge_plan_b_reference_date"] = now.date().isoformat() if charge_plan_b_start_unit is not None else None
     r["charge_plan_b_duration_units"] = charge_plan_b_duration_units
@@ -1800,7 +1940,18 @@ def compute(
     # ---------------------------------------------------------------
     window_price = pending_plan_average_price if pending_plan_average_price is not None else charge_window_average_price
     ceiling_price = charge_plan_price_limit if charge_plan_price_limit is not None else price_limit_at_window_start
-    is_price_favorable = float(window_price) <= float(ceiling_price)
+    # 2026.11.5: a critical-SoC deadline plan (see _plan_window) is by
+    # construction the cheapest option that still starts before the
+    # battery goes critical - waiting longer can only end in the critical
+    # override taking whatever is due then, so the gate accepts it. Judged
+    # on the reservation that's actually live (pending flag) once one
+    # exists, otherwise on this cycle's own search.
+    if pending_plan_start_unit is not None:
+        is_deadline_gate_override = bool(pending_plan_is_critical_deadline)
+    else:
+        is_deadline_gate_override = bool(is_critical_deadline_plan)
+    r["is_deadline_gate_override"] = is_deadline_gate_override
+    is_price_favorable = float(window_price) <= float(ceiling_price) or is_deadline_gate_override
     r["is_price_favorable"] = is_price_favorable
 
     is_soc_critical = soc < T[NUM_SOC_CRITICAL_PERCENT]

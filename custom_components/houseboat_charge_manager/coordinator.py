@@ -88,6 +88,8 @@ _DECISION_KEYS: tuple[str, ...] = (
     "pending_plan_b_duration_units",
     "is_split_chosen",
     "is_split_active",
+    "is_critical_deadline_plan",
+    "pending_plan_is_critical_deadline",
     "is_price_negative",
     "is_voyage_pending",
     "is_voyage_charge_forced",
