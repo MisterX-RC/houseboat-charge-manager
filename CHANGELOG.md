@@ -13,6 +13,103 @@ Versions are **year.month.release**, like ESS Manager's own (as of
 the releases in that month from 0 - `2026.10.0`, `2026.10.1`, ...,
 `2026.11.0`.
 
+## [2026.11.6] - 2026-11-25
+
+### Changed
+- **Fixed price ceiling during a full-charge (calibration/balance) cycle.**
+  Timo, reviewing the charge-window search with a diagnostics dump from
+  25-11 09:04: "Voor een balanceerlading is het denk ik de moeite waard om
+  de prijsdrempel wat te verhogen ... In het huidige systeem gaat de
+  drempel naar beneden omdat de accu voller raakt, dit blokkeert feitelijk
+  een 100% lading ALTIJD zolang de prijzen de 0 niet raken." The
+  SoC-dependent ceiling (14-day average x (1 - (soc-floor)/(ceiling-floor)))
+  hits 0 at `soc_ceiling_percent`, so the last stretch to 100 % could only
+  ever clear it at zero prices. During a full-charge cycle the ceiling is
+  now FIXED at the 14-day average + the new tunable **"Full-charge price
+  ceiling margin"** (`full_charge_price_margin_percent`, default 10 %),
+  independent of SoC. Outside a full-charge cycle nothing changes. All
+  ceiling evaluations (search, price-trim, split filter, deadline gate,
+  `price_limit`, `price_limit_at_window_start`) now go through one function,
+  so they can't disagree. New attributes `is_fixed_price_ceiling` /
+  `fixed_price_ceiling`. A calibration may now span several days: what
+  doesn't fit under the ceiling simply waits for later prices ("Ik vind
+  het niet erg als de balanceerlading over meerdere dagen getrokken
+  wordt").
+- **Every block must clear the ceiling on average - split blocks too.**
+  ("Een blok moet gemiddeld de prijsdrempel halen.") The split search used
+  to pick the cheapest split on total cost alone (since 2026-11-03 even
+  when no block cleared the ceiling) and left judging it to the start gate.
+  `_best_two_block_split` now takes per-block ceiling functions and returns
+  the cheapest split whose blocks each clear their own ceiling. In a
+  critical-SoC deadline split, block A (the safety part) stays exempt,
+  block B does not.
+- **Blocks never start or end on a quarter above their ceiling.** With the
+  average rule alone the 25-11 plan was still accepted unchanged under the
+  new +10 % ceiling (EUR 0.222): block A 09:00-15:30 (avg 0.206) opened on
+  EUR 0.296 and ended in the 14:30-15:30 peak, block B 18:45-24:00 (avg
+  0.218) opened on EUR 0.290 - the search/trim take the LONGEST placement
+  whose average fits, so a cheap middle "pays for" expensive edges. New
+  EDGE TRIM step strips such quarters off both ends of every block (the
+  average still judges the block as a whole; a single pricey quarter in
+  the middle is allowed). Exempt: below the SoC floor, and the front of a
+  deadline block A. Quarters beyond the known prices are dropped too (they
+  can't be judged). The flat-block extension may no longer re-add a quarter
+  above the block's ceiling, and its backward extension stops before the
+  block would fail the (SoC-dependent) ceiling at its new, earlier start -
+  that mismatch made the plan flicker Standby <-> Wait for start. New
+  attributes `edge_trim_units_a` / `edge_trim_units_b`. Result for 25-11
+  08:57: 09:45-14:30 (avg 0.183) + 19:45-24:00 (avg 0.209) instead of
+  09:00-15:30 + 18:45-24:00.
+
+### Fixed
+- **Split block B stayed on its original slot for the whole pause.** During
+  the pause the reservation was only replaced by a fresh split's block B -
+  but once block A has delivered part of the need a fresh search usually
+  no longer splits, so B kept its original (peak-straddling) slot. Replay
+  of the 25-11 state: B held at 18:45 on EUR 0.290 although a peak-free
+  19:45-24:00 was cheaper. The reservation is now replaced by the fresh
+  search's FIRST block (single block or block A of a fresh split) when it
+  is cheaper on average and starts after block A's stop + cooldown; the
+  fresh split's block B remains the fallback when the first block would
+  fall inside the cooldown. With tomorrow's prices known (13:00) the same
+  replay moves B to 22:00-06:00.
+- **Block B re-inherited block A's critical-deadline flag.** A fresh
+  reservation now carries the fresh search's own deadline status; only an
+  unchanged reservation inherits it (`charge_plan_b_is_critical_deadline`
+  follows the live reservation during the pause). On 25-11 the old flag
+  would have let block B start at 18:45 regardless of price.
+- **Reservation re-seeded every cycle on rounding alone.** The fresh
+  average (rounded to 4 decimals) was compared against the unrounded
+  locked average, so an identical window "won" and was re-reserved - and
+  re-extended - every 15 minutes. Both sides are now rounded the same way.
+- **Plans near the ceiling flickered between start times.** Several
+  near-equal plans sit right on the SoC-dependent ceiling, and the SoC
+  reading moves in 0.1 % steps (~EUR 0.0004 of ceiling): the displayed
+  start hopped 03:15 <-> 03:45 <-> 04:00 every few minutes in the
+  regression run. Fixes: SoC projections now drain over the real time to
+  each quarter (`idx + lead_units`, the next quarter starts up to 15 min
+  from now - not "now") instead of a saw-tooth that jumped at every quarter
+  roll-over; and a hysteresis band (`CEILING_HYSTERESIS`, EUR 0.001) for
+  the split filter, edge trim and extension cap - the previous cycle's
+  blocks/quarters keep their status inside the band, newcomers must clear
+  it. Not applied with the fixed full-charge ceiling (nothing noisy there).
+
+### Card
+- The price card draws the fixed full-charge ceiling as a flat dashed line
+  (instead of the SoC-projected curve) and judges block B against it.
+
+### Verification
+- Replay of the 25-11 09:04 dump, reconstruction of the 08:57 decision and
+  minute-by-minute day simulations from the real state (with and without
+  tomorrow's prices) - new suite `sim_v2026116.py` (scratchpad): plan,
+  tunable (0/10/25 %, missing key -> default), rule invariants over 240
+  situations (both dumps, calibration + normal mode), block-B re-planning,
+  no inherited deadline flag, stable reservation, fixed point + restart,
+  calibration night without sliding. Existing `sim_deadline.py` now runs in
+  normal mode (calibration rarely needs a deadline plan with the fixed
+  ceiling) with its "identical to old logic" section replaced by the rule
+  invariants; all green. Card rendered in Playwright without errors.
+
 ## [2026.11.5] - 2026-11-25
 
 ### Fixed

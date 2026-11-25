@@ -36,9 +36,10 @@ from __future__ import annotations
 import math
 from datetime import date, datetime, time, timedelta
 from statistics import mean
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from .const import (
+    DEFAULT_FULL_CHARGE_PRICE_MARGIN_PERCENT,
     NUM_BALANCE_SETTLE_MINUTES,
     NUM_BALANCE_VOLTAGE_THRESHOLD,
     NUM_BATTERY_SIZE_KWH,
@@ -50,6 +51,7 @@ from .const import (
     NUM_COOLDOWN_SOC_GUARD_PERCENT,
     NUM_FLAT_BLOCK_MARGIN,
     NUM_FLAT_BLOCK_TOLERANCE,
+    NUM_FULL_CHARGE_PRICE_MARGIN_PERCENT,
     NUM_HAS_CHARGE_NEED_THRESHOLD_KWH,
     NUM_HIGH_SHORE_LOAD_THRESHOLD_W,
     NUM_IS_CHARGING_THRESHOLD_W,
@@ -153,6 +155,12 @@ _DATETIME_KEYS = (
     "last_full_charge_completed_at",
     "charge_session_ended_at",
 )
+
+
+# EUR/kWh hysteresis band around the SoC-dependent price ceiling, used by
+# the split search's per-block filter, the edge trim and the flat-block
+# extension cap (2026.11.6) - see _split_ceiling / _price_above in compute().
+CEILING_HYSTERESIS = 0.001
 
 
 def _avg(values) -> float:
@@ -300,6 +308,8 @@ def _best_two_block_split(
     min_block_units: int,
     min_gap_units: int,
     max_first_start: Optional[int] = None,
+    block_a_ceiling: Optional[Callable[[int, int], float]] = None,
+    block_b_ceiling: Optional[Callable[[int, int], float]] = None,
 ) -> Optional[tuple[float, int, int, int, int]]:
     """Find the cheapest way to deliver `total_duration` units of charging
     as two separated, non-overlapping full-length blocks within
@@ -324,6 +334,13 @@ def _best_two_block_split(
     (block B is unconstrained) - used by the critical-SoC deadline search,
     which needs block A to begin before the battery would cross
     soc_critical_percent.
+
+    `block_a_ceiling` / `block_b_ceiling` (2026.11.6), when given, map a
+    block's (start index, length) to the maximum AVERAGE price that block
+    may have;
+    blocks above it are simply not candidates. "Een blok moet gemiddeld de
+    prijsdrempel halen" - so the result is the cheapest split whose blocks
+    each clear their own ceiling, not the cheapest split outright.
     """
     if total_duration < 2 * min_block_units or horizon < total_duration + min_gap_units:
         return None
@@ -350,6 +367,8 @@ def _best_two_block_split(
         suffix_min_idx = [-1] * (max_s2 + 2)
         for s2 in range(max_s2, -1, -1):
             cost2 = window_sum(s2, l2)
+            if block_b_ceiling is not None and cost2 / l2 > block_b_ceiling(s2, l2) + 1e-9:
+                cost2 = float("inf")
             if cost2 < suffix_min_cost[s2 + 1]:
                 suffix_min_cost[s2] = cost2
                 suffix_min_idx[s2] = s2
@@ -364,7 +383,12 @@ def _best_two_block_split(
             s2_floor = s1 + l1 + min_gap_units
             if s2_floor > max_s2:
                 continue
-            total_cost = window_sum(s1, l1) + suffix_min_cost[s2_floor]
+            if suffix_min_idx[s2_floor] < 0:
+                continue  # no block B clears its ceiling from here on
+            cost1 = window_sum(s1, l1)
+            if block_a_ceiling is not None and cost1 / l1 > block_a_ceiling(s1, l1) + 1e-9:
+                continue
+            total_cost = cost1 + suffix_min_cost[s2_floor]
             if best is None or total_cost < best[0]:
                 best = (total_cost, s1, l1, suffix_min_idx[s2_floor], l2)
     return best
@@ -859,6 +883,54 @@ def compute(
     soc_floor = float(T[NUM_SOC_FLOOR_PERCENT])
     soc_ceiling = float(T[NUM_SOC_CEILING_PERCENT])
     drain_per_unit = battery_drain_rate_percent_per_hour / 4
+    # 2026.11.6: interval_price[0] is the NEXT quarter, which starts
+    # `lead_units` (0 < lead <= 1) from now - not right now. Every SoC
+    # projection "at interval index idx" used to drain over idx units only,
+    # so the projection for one and the same clock time drifted down
+    # through each quarter and then jumped back up by a whole unit's drain
+    # at every quarter roll-over (a saw-tooth). With the per-block ceiling
+    # rule that saw-tooth made near-threshold plans flip back and forth
+    # every few minutes (displayed start 03:15 <-> 03:45 <-> 04:00 in the
+    # regression run). Draining over (idx + lead_units) makes the
+    # projection for a fixed clock time stable as `now` advances.
+    _minutes_today = _real_minutes_between(_local_midnight(now), now)
+    lead_units = (UNIT_MINUTES - (_minutes_today % UNIT_MINUTES)) / UNIT_MINUTES
+
+    # ---------------------------------------------------------------
+    # PRICE CEILING (single source of truth, 2026.11.6)
+    # ---------------------------------------------------------------
+    # Normally SoC-dependent: 14-day average x (1 - (soc-floor)/(ceiling-
+    # floor)), clamped at 0 - the fuller the battery, the less we're
+    # willing to pay. During a full-charge (calibration/balance) cycle
+    # that formula is self-defeating: the ceiling hits 0 at
+    # soc_ceiling_percent (90 %), so the last stretch to 100 % could only
+    # ever clear it at zero/negative prices, and long calibration plans
+    # were judged against an ever-dropping bar. Timo, 2026-11-25: "In het
+    # huidige systeem gaat de drempel naar beneden omdat de accu voller
+    # raakt, dit blokkeert feitelijk een 100% lading ALTIJD zolang de
+    # prijzen de 0 niet raken." So for that cycle the ceiling is FIXED at
+    # the 14-day average + full_charge_price_margin_percent (default 10 %),
+    # independent of SoC. Blocks must still average under it; whatever
+    # doesn't fit under it simply waits for later prices - the calibration
+    # may span several days ("Ik vind het niet erg als de balanceerlading
+    # over meerdere dagen getrokken wordt").
+    # Every ceiling evaluation below (search, trim, split filter, deadline
+    # gate, price_limit, price_limit_at_window_start) goes through
+    # _ceiling_for_soc so the two modes can never disagree.
+    full_charge_price_margin = float(
+        T.get(NUM_FULL_CHARGE_PRICE_MARGIN_PERCENT, DEFAULT_FULL_CHARGE_PRICE_MARGIN_PERCENT)
+    ) / 100
+    is_fixed_price_ceiling = bool(effective_full_charge_cycle)
+    r["is_fixed_price_ceiling"] = is_fixed_price_ceiling
+    # abs() so a (theoretical) negative 14-day average is loosened by the
+    # margin rather than tightened.
+    fixed_price_ceiling = price_14d_average + abs(price_14d_average) * full_charge_price_margin
+    r["fixed_price_ceiling"] = round(fixed_price_ceiling, 4) if is_fixed_price_ceiling else None
+
+    def _ceiling_for_soc(projected_soc: float) -> float:
+        if is_fixed_price_ceiling:
+            return fixed_price_ceiling
+        return price_14d_average * max(1 - ((projected_soc - soc_floor) / (soc_ceiling - soc_floor)), 0)
 
     # ---------------------------------------------------------------
     # CRITICAL-SoC DEADLINE (2026.11.5)
@@ -883,8 +955,8 @@ def compute(
     gate_soc_floor_clamp = soc_floor if soc >= soc_floor else 0.0
 
     def _gate_ceiling_at(idx: int) -> float:
-        projected = max(soc - drain_per_unit * idx, gate_soc_floor_clamp)
-        return price_14d_average * max(1 - ((projected - soc_floor) / (soc_ceiling - soc_floor)), 0)
+        projected = max(soc - drain_per_unit * (idx + lead_units), gate_soc_floor_clamp)
+        return _ceiling_for_soc(projected)
 
     # -----------------------------------------------------------------
     # CHEAPEST WINDOW SEARCH / SPLIT-SESSION SEARCH / FLAT-BLOCK EXTENSION
@@ -931,8 +1003,8 @@ def compute(
             if len(window) < duration:
                 continue
             window_average = _avg(window)
-            projected_soc = max(soc - drain_per_unit * idx, soc_floor)
-            projected_ceiling = price_14d_average * max(1 - ((projected_soc - soc_floor) / (soc_ceiling - soc_floor)), 0)
+            projected_soc = max(soc - drain_per_unit * (idx + lead_units), soc_floor)
+            projected_ceiling = _ceiling_for_soc(projected_soc)
             if window_average <= projected_ceiling and window_average < best_average:
                 best_average, best_index = window_average, idx
         price_limited_start_index = best_index
@@ -942,8 +1014,8 @@ def compute(
         full_duration = max(plan_charge_time_units, 1)
         window = interval_price[anchor : anchor + full_duration]
         full_average = _avg(window)
-        full_projected_soc = max(soc - drain_per_unit * anchor, soc_floor)
-        full_ceiling = price_14d_average * max(1 - ((full_projected_soc - soc_floor) / (soc_ceiling - soc_floor)), 0)
+        full_projected_soc = max(soc - drain_per_unit * (anchor + lead_units), soc_floor)
+        full_ceiling = _ceiling_for_soc(full_projected_soc)
         best_len, best_a = 0, 0
         if window and full_average > full_ceiling and min(window) < full_ceiling:
             for a in range(full_duration):
@@ -956,8 +1028,8 @@ def compute(
                     if not trial_window:
                         continue
                     trial_average = _avg(trial_window)
-                    trial_soc = max(soc - drain_per_unit * trial_start, soc_floor)
-                    trial_ceiling = price_14d_average * max(1 - ((trial_soc - soc_floor) / (soc_ceiling - soc_floor)), 0)
+                    trial_soc = max(soc - drain_per_unit * (trial_start + lead_units), soc_floor)
+                    trial_ceiling = _ceiling_for_soc(trial_soc)
                     if trial_average <= trial_ceiling:
                         best_len, best_a = trial_len, a
         price_trim_start_index = (anchor + best_a) if best_len > 0 else anchor
@@ -1018,10 +1090,51 @@ def compute(
         # unchanged), so this only adds cases where it can win, never
         # forces it.
         split_min_gap_units = max(math.ceil(float(T[NUM_COOLDOWN_MINUTES]) / UNIT_MINUTES), 1)
+
+        # Hysteresis for the per-block ceiling (2026.11.6). Several near-
+        # equal splits sit right on the ceiling, and the SoC reading moves in
+        # 0.1 % steps (~EUR 0.0004 of ceiling) - so without this a different
+        # candidate fell inside/outside the ceiling every few minutes and the
+        # displayed plan flickered between three start times. The blocks
+        # chosen last cycle (absolute units, as searched - before edge trim)
+        # may exceed the ceiling by CEILING_HYSTERESIS; any other block
+        # must stay that much below it. A plan then only changes when an
+        # alternative is genuinely better, not on sensor noise.
+        _prev_split_abs = P.get("split_candidate_abs")
+        _incumbent_blocks: set[tuple[int, int]] = set()
+        if isinstance(_prev_split_abs, (list, tuple)) and len(_prev_split_abs) == 4:
+            try:
+                _incumbent_blocks = {
+                    (int(_prev_split_abs[0]), int(_prev_split_abs[1])),
+                    (int(_prev_split_abs[2]), int(_prev_split_abs[3])),
+                }
+            except (TypeError, ValueError):
+                _incumbent_blocks = set()
+
+        def _split_ceiling(idx: int, length: int) -> float:
+            base = _gate_ceiling_at(idx)
+            if is_fixed_price_ceiling:
+                return base  # constant ceiling - nothing to be noisy about
+            if (interval_start_unit + idx, length) in _incumbent_blocks:
+                return base + CEILING_HYSTERESIS
+            return base - CEILING_HYSTERESIS
+
         split_candidate: Optional[tuple[float, int, int, int, int]] = None
         if not is_below_soc_floor:
+            # 2026.11.6: each block must clear its own ceiling on average
+            # ("Een blok moet gemiddeld de prijsdrempel halen"). Before, the
+            # split was chosen on total cost alone - since 2026-11-03 even
+            # when no block cleared the ceiling - and only the start gate
+            # judged it afterwards; with a long calibration need and only
+            # today's prices known that produced splits straddling both the
+            # morning and the evening peak (25-11: 09:00-15:30 + 18:45-24:00,
+            # block averages EUR 0.206/0.218 against a ~0.187 ceiling). Now
+            # such a split simply isn't a candidate; the price-trim's
+            # shorter, under-the-ceiling block is used instead and the rest
+            # of the need is planned once later prices are known.
             split_candidate = _best_two_block_split(
-                interval_price, horizon, duration, MIN_SPLIT_BLOCK_UNITS, split_min_gap_units
+                interval_price, horizon, duration, MIN_SPLIT_BLOCK_UNITS, split_min_gap_units,
+                block_a_ceiling=_split_ceiling, block_b_ceiling=_split_ceiling,
             )
 
         cheapest_window = interval_price[cheapest_start_index : cheapest_start_index + duration]
@@ -1113,6 +1226,12 @@ def compute(
                     deadline_split = _best_two_block_split(
                         interval_price, horizon, duration, MIN_SPLIT_BLOCK_UNITS, split_min_gap_units,
                         max_first_start=deadline,
+                        # Block A is the safety part and may exceed the
+                        # ceiling (that's the point of the deadline plan);
+                        # block B has no such excuse - by then the battery
+                        # has been charged - so it must clear its ceiling
+                        # like any other block (2026.11.6).
+                        block_b_ceiling=_split_ceiling,
                     )
                 if deadline_split is not None and (best_single is None or deadline_split[0] < best_single[0] - 1e-6):
                     split_candidate = deadline_split
@@ -1131,6 +1250,104 @@ def compute(
                     r["effective_duration_units"] = effective_duration_units
         r["is_critical_deadline_plan"] = is_critical_deadline_plan
         r["low_price"] = min(all_price) if all_price else 0.0
+
+        r["split_candidate_abs"] = (
+            [
+                interval_start_unit + split_candidate[1], split_candidate[2],
+                interval_start_unit + split_candidate[3], split_candidate[4],
+            ]
+            if (is_split_chosen and split_candidate is not None)
+            else None
+        )
+
+        # ---------------------------------------------------------------
+        # EDGE TRIM (2026.11.6)
+        # ---------------------------------------------------------------
+        # The average-price rule alone still let blocks begin or end on a
+        # peak: the search/trim take the LONGEST placement whose average
+        # stays under the ceiling, so a cheap middle "pays for" expensive
+        # edges (25-11: block A 09:00-15:30 started at EUR 0.296 and ended
+        # in the 14:30-15:30 peak, average 0.206 - fine against a 0.222
+        # ceiling). Timo agreed: a block never starts or ends on a quarter
+        # priced above its ceiling - strip such quarters off both ends;
+        # the average still judges the block as a whole, a single pricey
+        # quarter in the middle is allowed. What's stripped is simply
+        # re-planned later (after this block, or with tomorrow's prices).
+        # Exempt: below the SoC floor (price nuance deliberately ignored
+        # there), and the FRONT of a deadline block A (it has to start
+        # before the battery goes critical; its tail is trimmed as usual).
+        edge_trim_units_a = 0
+        edge_trim_units_b = 0
+
+        # Same hysteresis as the split filter, per quarter: the quarters
+        # covered by last cycle's planned window(s) (absolute units) keep
+        # their in/out status while their price lies within
+        # CEILING_HYSTERESIS of the (noisy, SoC-dependent) ceiling - so a
+        # block edge doesn't hop back and forth a quarter every few minutes
+        # on 0.1 % SoC steps (seen as start 04:15 <-> 04:30 in the
+        # regression run). No band with the fixed full-charge ceiling.
+        _prev_window_units: set[int] = set()
+        try:
+            _p_isu = P.get("interval_start_unit")
+            if _p_isu is not None:
+                for _s_key, _l_key in (
+                    ("effective_start_index", "planned_charge_time_units"),
+                    ("split_b_effective_start_index", "split_b_planned_duration_units"),
+                ):
+                    _ps, _pl = P.get(_s_key), P.get(_l_key)
+                    if _ps is not None and _pl is not None:
+                        _prev_window_units.update(range(int(_p_isu) + int(_ps), int(_p_isu) + int(_ps) + int(_pl)))
+        except (TypeError, ValueError):
+            _prev_window_units = set()
+
+        def _price_above(idx: int, ceiling: float) -> bool:
+            price = interval_price[idx]
+            if is_fixed_price_ceiling:
+                return price > ceiling + 1e-9
+            if price > ceiling + CEILING_HYSTERESIS:
+                return True
+            if price <= ceiling - CEILING_HYSTERESIS:
+                return False
+            return (interval_start_unit + idx) not in _prev_window_units
+
+        def _trim_edges(s: int, length: int, trim_front: bool = True) -> tuple[int, int]:
+            ceiling = _gate_ceiling_at(s)
+            # A window can run past the known prices when the need is longer
+            # than what's still known (the price-trim tolerates truncated
+            # slices). Quarters without a price can't be judged against the
+            # ceiling, so they're dropped too - they get planned once the
+            # next day's prices are published ("wat niet past wacht op
+            # latere prijzen").
+            ns, ne = s, min(s + length, len(interval_price))
+            if ne <= ns:
+                return s, length
+            if trim_front:
+                while ns < ne and _price_above(ns, ceiling):
+                    ns += 1
+            while ne > ns and _price_above(ne - 1, ceiling):
+                ne -= 1
+            if ne <= ns:
+                # Every quarter is above the ceiling - nothing sensible to
+                # keep; leave it untouched (the start gate refuses it anyway
+                # unless it's a deadline block).
+                return s, length
+            return ns, ne - ns
+
+        if not is_below_soc_floor:
+            new_start, new_len = _trim_edges(
+                start_index, max(effective_duration_units, 1), trim_front=not is_critical_deadline_plan
+            )
+            edge_trim_units_a = max(effective_duration_units, 1) - new_len
+            if edge_trim_units_a > 0:
+                start_index, effective_duration_units = new_start, new_len
+                r["start_index"] = start_index
+                r["effective_duration_units"] = effective_duration_units
+            if is_split_chosen and split_candidate is not None:
+                b_start, b_len = _trim_edges(split_candidate[3], split_candidate[4])
+                edge_trim_units_b = split_candidate[4] - b_len
+                split_candidate = (split_candidate[0], start_index, effective_duration_units, b_start, b_len)
+        r["edge_trim_units_a"] = edge_trim_units_a
+        r["edge_trim_units_b"] = edge_trim_units_b if is_split_chosen else None
 
         # Block B of a chosen split - interval-relative (same frame as
         # start_index), consumed by PRE-START LOCK / SESSION LOCK-IN below to
@@ -1173,8 +1390,17 @@ def compute(
             absolute_threshold = avg_price + flat_block_price_tolerance
             return max(percentage_threshold, absolute_threshold)
 
+        # 2026.11.6: the extension may never re-add a quarter above the
+        # block's own price ceiling (that would undo the EDGE TRIM above).
+        # Not below the SoC floor, where the ceiling isn't consulted at all.
+        # (The cap itself is applied per quarter inside _extend via
+        # block_ceiling, with hysteresis; the attribute shows the effective,
+        # capped value for the dashboard.)
         flat_block_price_threshold = _flat_threshold(charge_window_average_price)
-        r["flat_block_price_threshold"] = flat_block_price_threshold
+        ceiling_a = _gate_ceiling_at(start)
+        r["flat_block_price_threshold"] = (
+            flat_block_price_threshold if is_below_soc_floor else min(flat_block_price_threshold, ceiling_a)
+        )
 
         # How much the base (price-ceiling-qualifying, possibly price-trimmed)
         # window delivers on its own - computed here (and reused below as
@@ -1188,7 +1414,13 @@ def compute(
         # using only block A's own l1 here would silently drop block B's
         # share of the already-granted energy and overstate how much headroom
         # is left for extension.
-        if is_split_chosen:
+        # 2026.11.6: EDGE TRIM can shorten either split block, so l1+l2 no
+        # longer always equals plan_charge_time_units - count what's left.
+        if is_split_chosen and (effective_duration_units + split_b_duration_units) < max(plan_charge_time_units, 1):
+            base_charge_kwh = round(
+                (effective_duration_units + split_b_duration_units) * (battery_charge_speed / 4) * charger_efficiency, 2
+            )
+        elif is_split_chosen:
             base_charge_kwh = plan_charge_kwh
         elif effective_duration_units < max(plan_charge_time_units, 1):
             base_charge_kwh = round(max(effective_duration_units, 1) * (battery_charge_speed / 4) * charger_efficiency, 2)
@@ -1212,7 +1444,15 @@ def compute(
             max_extra_units = 0
         max_extra_units = max(max_extra_units, 0)
 
-        def _extend(probe_start: int, step: int, budget: int, threshold: float, limit_idx: Optional[int] = None) -> int:
+        def _extend(
+            probe_start: int,
+            step: int,
+            budget: int,
+            threshold: float,
+            limit_idx: Optional[int] = None,
+            block_avg: Optional[float] = None,
+            block_ceiling: Optional[float] = None,
+        ) -> int:
             """Walk from `probe_start` in `step` direction (+1/-1), counting
             consecutive in-bounds units priced at or below `threshold`,
             stopping at the first disqualifying unit (same "must be
@@ -1229,6 +1469,29 @@ def compute(
                     break
                 if limit_idx is not None and ((step > 0 and idx >= limit_idx) or (step < 0 and idx <= limit_idx)):
                     break
+                # 2026.11.6: when extending BACKWARD (block_avg given), the
+                # block's start moves earlier - where the projected SoC is
+                # higher and the SoC-dependent ceiling therefore LOWER - and
+                # the start gate judges the block against the ceiling at that
+                # new start. Stop before a position where the block would no
+                # longer clear it, or a block that passed at its search
+                # position gets refused once extended (seen as the plan
+                # flickering Standby <-> Wait for start every few minutes).
+                # No-op with the fixed full-charge ceiling and below the floor.
+                if block_avg is not None and not is_below_soc_floor:
+                    _c_here = _gate_ceiling_at(idx)
+                    _band = 0.0 if is_fixed_price_ceiling else CEILING_HYSTERESIS
+                    if block_avg > _c_here + _band or (
+                        block_avg > _c_here - _band - 1e-9
+                        and _band > 0
+                        and (interval_start_unit + idx) not in _prev_window_units
+                    ):
+                        break
+                # 2026.11.6: never re-add a quarter above the block's own
+                # ceiling (would undo the EDGE TRIM) - same hysteresis band.
+                if block_ceiling is not None and not is_below_soc_floor and _price_above(idx, block_ceiling):
+                    extending = False
+                    continue
                 if interval_price[idx] <= threshold:
                     extra += 1
                 else:
@@ -1246,9 +1509,13 @@ def compute(
         if not is_split_chosen:
             # Single block (unchanged pre-2026.10.13 behaviour): forward gets
             # first claim on the budget, backward gets whatever's left.
-            forward_units = _extend(start + ext_duration, 1, max_extra_units, flat_block_price_threshold)
+            forward_units = _extend(start + ext_duration, 1, max_extra_units, flat_block_price_threshold, block_ceiling=ceiling_a)
             remaining_budget = max(max_extra_units - forward_units, 0)
-            backward_units = _extend(start - 1, -1, remaining_budget, flat_block_price_threshold)
+            backward_units = _extend(
+                start - 1, -1, remaining_budget, flat_block_price_threshold,
+                block_avg=None if is_critical_deadline_plan else charge_window_average_price,
+                block_ceiling=ceiling_a,
+            )
             total_extension_units = forward_units + backward_units
         else:
             # Chosen split (2026.10.13 refinement): each block is judged on
@@ -1265,41 +1532,62 @@ def compute(
             # based on the cheap block's now-settled (possibly already
             # extended) boundary rather than its original search position.
             flat_block_price_threshold_b = _flat_threshold(split_b_average_price)
+            ceiling_b = _gate_ceiling_at(split_b_start_index)
             a_is_cheaper = charge_window_average_price <= split_b_average_price
             remaining_budget = max_extra_units
 
             if a_is_cheaper:
-                a_back = _extend(start - 1, -1, remaining_budget, flat_block_price_threshold)
+                a_back = _extend(
+                    start - 1, -1, remaining_budget, flat_block_price_threshold,
+                    block_avg=None if is_critical_deadline_plan else charge_window_average_price,
+                    block_ceiling=ceiling_a,
+                )
                 remaining_budget = max(remaining_budget - a_back, 0)
                 a_fwd_limit = split_b_start_index - split_min_gap_units
-                a_fwd = _extend(start + ext_duration, 1, remaining_budget, flat_block_price_threshold, a_fwd_limit)
+                a_fwd = _extend(
+                    start + ext_duration, 1, remaining_budget, flat_block_price_threshold, a_fwd_limit,
+                    block_ceiling=ceiling_a,
+                )
                 remaining_budget = max(remaining_budget - a_fwd, 0)
 
                 a_new_end = start + ext_duration + a_fwd
                 b_fwd = _extend(
-                    split_b_start_index + split_b_duration_units, 1, remaining_budget, flat_block_price_threshold_b
+                    split_b_start_index + split_b_duration_units, 1, remaining_budget, flat_block_price_threshold_b,
+                    block_ceiling=ceiling_b,
                 )
                 remaining_budget = max(remaining_budget - b_fwd, 0)
                 b_back_limit = a_new_end + split_min_gap_units - 1
                 b_back = _extend(
-                    split_b_start_index - 1, -1, remaining_budget, flat_block_price_threshold_b, b_back_limit
+                    split_b_start_index - 1, -1, remaining_budget, flat_block_price_threshold_b, b_back_limit,
+                    block_avg=split_b_average_price,
+                    block_ceiling=ceiling_b,
                 )
             else:
                 b_fwd = _extend(
-                    split_b_start_index + split_b_duration_units, 1, remaining_budget, flat_block_price_threshold_b
+                    split_b_start_index + split_b_duration_units, 1, remaining_budget, flat_block_price_threshold_b,
+                    block_ceiling=ceiling_b,
                 )
                 remaining_budget = max(remaining_budget - b_fwd, 0)
                 b_back_limit = (start + ext_duration) + split_min_gap_units - 1
                 b_back = _extend(
-                    split_b_start_index - 1, -1, remaining_budget, flat_block_price_threshold_b, b_back_limit
+                    split_b_start_index - 1, -1, remaining_budget, flat_block_price_threshold_b, b_back_limit,
+                    block_avg=split_b_average_price,
+                    block_ceiling=ceiling_b,
                 )
                 remaining_budget = max(remaining_budget - b_back, 0)
 
                 b_new_start = split_b_start_index - b_back
-                a_back = _extend(start - 1, -1, remaining_budget, flat_block_price_threshold)
+                a_back = _extend(
+                    start - 1, -1, remaining_budget, flat_block_price_threshold,
+                    block_avg=None if is_critical_deadline_plan else charge_window_average_price,
+                    block_ceiling=ceiling_a,
+                )
                 remaining_budget = max(remaining_budget - a_back, 0)
                 a_fwd_limit = b_new_start - split_min_gap_units
-                a_fwd = _extend(start + ext_duration, 1, remaining_budget, flat_block_price_threshold, a_fwd_limit)
+                a_fwd = _extend(
+                    start + ext_duration, 1, remaining_budget, flat_block_price_threshold, a_fwd_limit,
+                    block_ceiling=ceiling_a,
+                )
 
             forward_units, backward_units = a_fwd, a_back
             split_b_forward_extension_units, split_b_backward_extension_units = b_fwd, b_back
@@ -1385,7 +1673,7 @@ def compute(
     plan = _plan_window(plan_charge_kwh, plan_charge_time_units)
     for _lookahead_pass in range(3):
         units_ahead_candidate = plan["effective_start_index"]
-        soc_at_candidate_start = max(soc - drain_per_unit * units_ahead_candidate, soc_floor)
+        soc_at_candidate_start = max(soc - drain_per_unit * (units_ahead_candidate + lead_units), soc_floor)
         projected_energy_candidate = round(battery_size * (soc_at_candidate_start / 100), 2)
         projected_gap_candidate = max(round(target_charge_level - projected_energy_candidate, 1), 0.0)
         projected_charge_kwh_candidate = (
@@ -1476,14 +1764,63 @@ def compute(
             locked_b_avg = _avg(locked_b_window) if locked_b_window else 1000.0
         else:
             locked_b_avg = 1000.0
+        # 2026.11.6: block B is "the rest of the need", and the reservation
+        # held during the pause is simply "the next block to charge". The
+        # natural candidate for that is the FRESH search's own first block
+        # (single block, or block A of a fresh split): once block A has
+        # delivered part of the need the fresh search often no longer
+        # splits, or splits differently - and the old check below (fresh
+        # split's block B only) then either never fired (25-11 replay: B
+        # held at 18:45 on EUR 0.290 while a fresh, peak-free 19:45-24:00
+        # block was cheaper) or jumped to the fresh split's SECOND half,
+        # skipping a cheap block earlier in between. Accepted only at or
+        # after block A's stop + cooldown - so the reconnect lock-out the
+        # original split's gap was sized for is always respected - and only when
+        # genuinely cheaper on average. Whatever the reservation doesn't
+        # cover is planned again after it ("vanzelf vol").
+        # Earliest acceptable start for a replacement: block A's stop plus
+        # the cooldown (the same lock-out the original split's gap was sized
+        # for). If that stop moment isn't known (e.g. right after a restart
+        # without it persisted), fall back to "not before the reserved slot".
+        _a_ended_at = pdt("charge_session_ended_at")
+        if _a_ended_at is not None:
+            _cooldown_left_min = max(
+                (_a_ended_at + timedelta(minutes=T[NUM_COOLDOWN_MINUTES]) - now).total_seconds() / 60, 0.0
+            )
+            fresh_next_after_cooldown = effective_start_index * UNIT_MINUTES >= _cooldown_left_min
+        else:
+            fresh_next_after_cooldown = (interval_start_unit + effective_start_index) >= int(prev_charge_plan_b_start)
+        reseed_b_next = (
+            (not is_start_imminent)
+            and has_charge_need
+            and fresh_next_after_cooldown
+            # Both sides rounded the same way + epsilon: fresh averages are
+            # stored rounded to 4 decimals, the locked one wasn't, so an
+            # IDENTICAL window could otherwise "win" on rounding alone and
+            # be re-reserved (and re-extended) every cycle.
+            and charge_window_average_price < round(locked_b_avg, 4) - 1e-6
+        )
+        # Fallback (2026-11-10 behaviour): the fresh split's block B, when
+        # the fresh first block itself isn't usable (e.g. it starts before
+        # the reserved slot, inside the cooldown gap).
         reseed_b = (
             (not is_start_imminent)
+            and (not reseed_b_next)
+            # Only when the fresh first block is genuinely unusable (would
+            # start inside the cooldown) - otherwise this would flip-flop
+            # with reseed_b_next.
+            and (not fresh_next_after_cooldown)
             and is_split_chosen
             and split_b_average_price is not None
-            and split_b_average_price < locked_b_avg
+            and split_b_average_price < round(locked_b_avg, 4) - 1e-6
         )
 
-        if reseed_b:
+        if reseed_b_next:
+            live_start_unit = interval_start_unit + effective_start_index
+            pending_plan_duration_units = planned_charge_time_units
+            pending_plan_average_price = charge_window_average_price
+            pending_mode = "reseed"
+        elif reseed_b:
             live_start_unit = interval_start_unit + split_b_effective_start_index
             pending_plan_duration_units = split_b_planned_duration_units
             pending_plan_average_price = split_b_average_price
@@ -1506,6 +1843,12 @@ def compute(
         # chosen by the critical-SoC deadline search must be able to finish
         # its second half too, not stall on the price gate after the pause.
         pending_plan_is_critical_deadline = bool(P.get("charge_plan_b_is_critical_deadline", False))
+        if reseed_b or reseed_b_next:
+            # A FRESH reservation (fresh split's block B, or a fresh single
+            # block) carries the fresh search's own deadline status, not the
+            # one the original block A was planned under (2026.11.6). Only
+            # an unchanged ("keep") reservation inherits it.
+            pending_plan_is_critical_deadline = bool(is_critical_deadline_plan)
     else:
         is_start_imminent = (not is_charging) and has_charge_need and (effective_start_index <= 1)
         r["is_start_imminent"] = is_start_imminent
@@ -1726,6 +2069,11 @@ def compute(
     # lock-in, held through the pause, gone with the reservation itself.
     if charge_plan_b_start_unit is None:
         charge_plan_b_is_critical_deadline = None
+    elif prev_charge_plan_b_start is not None and awaiting_split_b:
+        # 2026.11.6: during the pause the reservation can be replaced by a
+        # fresh single block (reseed_b_next) carrying its own flag - follow
+        # the live reservation's flag instead of re-inheriting block A's.
+        charge_plan_b_is_critical_deadline = bool(pending_plan_is_critical_deadline)
     elif prev_charge_plan_b_start is not None:
         charge_plan_b_is_critical_deadline = bool(P.get("charge_plan_b_is_critical_deadline", False))
     else:
@@ -1773,9 +2121,15 @@ def compute(
     r["soc_ceiling_percentage"] = soc_ceiling
     r["current_soc"] = soc
     r["price_14d_average"] = price_14d_average
-    price_ceiling_multiplier = round(max(1 - ((soc - soc_floor) / (soc_ceiling - soc_floor)), 0), 2)
-    r["price_ceiling_multiplier"] = price_ceiling_multiplier
-    r["price_limit"] = round(price_14d_average * price_ceiling_multiplier, 4)
+    if is_fixed_price_ceiling:
+        # Fixed full-charge ceiling (see PRICE CEILING above): SoC-independent.
+        price_ceiling_multiplier = round(1 + full_charge_price_margin, 2)
+        r["price_ceiling_multiplier"] = price_ceiling_multiplier
+        r["price_limit"] = round(fixed_price_ceiling, 4)
+    else:
+        price_ceiling_multiplier = round(max(1 - ((soc - soc_floor) / (soc_ceiling - soc_floor)), 0), 2)
+        r["price_ceiling_multiplier"] = price_ceiling_multiplier
+        r["price_limit"] = round(price_14d_average * price_ceiling_multiplier, 4)
 
     # The floor is only a believable LOWER BOUND on this projection when we
     # start ABOVE it: in that case, if a pure no-charging drain would carry
@@ -1799,11 +2153,9 @@ def compute(
     # bounded only at 0.
     units_ahead = max(start_unit - interval_start_unit, 0)
     soc_at_window_start_floor = soc_floor if soc >= soc_floor else 0.0
-    soc_at_window_start = round(max(soc - drain_per_unit * units_ahead, soc_at_window_start_floor), 2)
+    soc_at_window_start = round(max(soc - drain_per_unit * (units_ahead + lead_units), soc_at_window_start_floor), 2)
     r["soc_at_window_start"] = soc_at_window_start
-    price_limit_at_window_start = round(
-        price_14d_average * max(1 - ((soc_at_window_start - soc_floor) / (soc_ceiling - soc_floor)), 0), 4
-    )
+    price_limit_at_window_start = round(_ceiling_for_soc(soc_at_window_start), 4)
     r["price_limit_at_window_start"] = price_limit_at_window_start
 
     # What charge_kwh/gap_kwh looks like using the PROJECTED

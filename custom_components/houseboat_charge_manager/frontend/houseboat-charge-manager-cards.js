@@ -503,6 +503,11 @@ class HouseboatPriceCard extends HTMLElement {
     const price14d = num(attrs.price_14d_average);
     const socNow = num(attrs.current_soc);
     const canProject = floorSoc !== null && ceilingSoc !== null && ceilingSoc > floorSoc && price14d !== null && socNow !== null;
+    // 2026.11.6: during a full-charge (calibration/balance) cycle the sensor
+    // uses a FIXED ceiling (14-day average + margin), independent of SoC -
+    // draw it as a flat line and judge block B against it, instead of the
+    // SoC-projected curve.
+    const fixedCeiling = attrs.is_fixed_price_ceiling ? num(attrs.fixed_price_ceiling) : null;
     // Projected SoC waypoints (now -> drain down to soc_at_window_start ->
     // rise through the charge window(s), split proportionally by duration
     // when the plan is a chosen split -> drain again for the rest of the
@@ -562,7 +567,9 @@ class HouseboatPriceCard extends HTMLElement {
           const windowPriceB = attrs.pending_plan_b_average_price != null
             ? Number(attrs.pending_plan_b_average_price)
             : (Number(attrs.split_b_average_price) || 0);
-          bFavorable = canProject ? windowPriceB <= price14d * limitMultAt(bStartIfANoop) : aFavorable;
+          bFavorable = fixedCeiling !== null
+            ? windowPriceB <= fixedCeiling
+            : (canProject ? windowPriceB <= price14d * limitMultAt(bStartIfANoop) : aFavorable);
 
           if (aFavorable && bFavorable) {
             // Both clear their own bar: split the total rise
@@ -614,7 +621,7 @@ class HouseboatPriceCard extends HTMLElement {
       return socWaypoints[socWaypoints.length - 1].soc;
     };
     let lo = Math.min(0, ...valid, limitVal !== null ? limitVal : 0);
-    let hi = Math.max(...valid, limitVal !== null ? limitVal : 0, canProject ? price14d : 0);
+    let hi = Math.max(...valid, limitVal !== null ? limitVal : 0, canProject ? price14d : 0, fixedCeiling !== null ? fixedCeiling : 0);
     const steps = [0.01, 0.02, 0.05, 0.1, 0.2, 0.25, 0.5, 1, 2, 5];
     const step = steps.find((s) => (hi - lo) / s <= 5) || 10;
     lo = Math.floor(lo / step + 1e-9) * step;
@@ -703,7 +710,9 @@ class HouseboatPriceCard extends HTMLElement {
     }
     const xNow = x(now);
     let limitLine = "";
-    if (canProject) {
+    if (fixedCeiling !== null) {
+      limitLine = `<line x1="${X0}" y1="${r1(y(fixedCeiling))}" x2="${W}" y2="${r1(y(fixedCeiling))}" style="stroke:${opt.limit_color}" stroke-width="1.5" stroke-dasharray="4 3"/>`;
+    } else if (canProject) {
       let d = "";
       for (let i = cur; i < n; i++) {
         const projSoc = clamp(socAt(i), floorSoc, ceilingSoc);

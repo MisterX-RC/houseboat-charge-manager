@@ -189,6 +189,14 @@ DEFAULT_PRICE_NEGATIVE_THRESHOLD = -0.05
 NUM_SOC_CRITICAL_PERCENT = "soc_critical_percent"
 DEFAULT_SOC_CRITICAL_PERCENT = 40.0
 
+# 2026.11.6: during a full-charge (calibration/balance) cycle the price
+# ceiling is no longer SoC-dependent - the SoC formula drops to 0 at
+# soc_ceiling_percent, which made a 100 % charge practically impossible
+# unless prices went to zero. Instead: a FIXED ceiling of the 14-day
+# average price plus this margin (default +10 %).
+NUM_FULL_CHARGE_PRICE_MARGIN_PERCENT = "full_charge_price_margin_percent"
+DEFAULT_FULL_CHARGE_PRICE_MARGIN_PERCENT = 10.0
+
 # In vacation mode, how many days of usable energy (above the low-battery
 # floor) should be available at departure time. Replaces the fixed 90%
 # vacation ceiling with a dynamic target; the default (15) is deliberately
@@ -238,6 +246,7 @@ NUMBER_DEFINITIONS: tuple[tuple, ...] = (
     (NUM_HIGH_SHORE_LOAD_THRESHOLD_W, DEFAULT_HIGH_SHORE_LOAD_THRESHOLD_W, "W", 0, 5000, 10, "mdi:power-plug", "High shore-load threshold"),
     (NUM_PRICE_NEGATIVE_THRESHOLD, DEFAULT_PRICE_NEGATIVE_THRESHOLD, "€/kWh", -1.0, 0, 0.01, "mdi:currency-eur", "Negative-price charging threshold"),
     (NUM_SOC_CRITICAL_PERCENT, DEFAULT_SOC_CRITICAL_PERCENT, "%", 0, 100, 1, "mdi:battery-alert", "Critical SoC threshold"),
+    (NUM_FULL_CHARGE_PRICE_MARGIN_PERCENT, DEFAULT_FULL_CHARGE_PRICE_MARGIN_PERCENT, "%", 0, 100, 1, "mdi:battery-sync", "Full-charge price ceiling margin"),
     (NUM_VACATION_DEPARTURE_TARGET_DAYS, DEFAULT_VACATION_DEPARTURE_TARGET_DAYS, "d", 1, 15, 1, "mdi:calendar-clock", "Vacation departure runway (days)"),
     (NUM_VACATION_DEPARTURE_BUFFER_HOURS, DEFAULT_VACATION_DEPARTURE_BUFFER_HOURS, "h", 0, 12, 0.5, "mdi:timer-sand", "Vacation departure buffer"),
 )
